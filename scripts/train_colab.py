@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import inspect
 import json
 import os
 import textwrap
@@ -20,6 +21,7 @@ def _bootstrap_src_path() -> None:
 _bootstrap_src_path()
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 from tqdm import tqdm
@@ -52,9 +54,286 @@ def ctc_loss_from_logits(logits, labels, label_lengths, blank_id: int):
     )
 
 
+def _as_output_dict(output) -> dict:
+    """Normalize a variety of model outputs into a dict."""
+    if isinstance(output, dict):
+        return output
+    if torch.is_tensor(output):
+        return {"logits": output}
+    if isinstance(output, tuple) and len(output) == 2 and torch.is_tensor(output[0]):
+        return {"logits": output[0], "aux_loss": output[1]}
+    if isinstance(output, tuple) and len(output) == 3 and torch.is_tensor(output[0]):
+        return {"logits": output[0], "aux_loss": output[1], "extra": output[2]}
+    return {"raw": output}
+
+
+def _extract_logits_pair(outputs: dict) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    """Return (coarse_logits, refined_logits). Either can be None."""
+    for key in ("logits_pair", "logits_list", "logits_all"):
+        val = outputs.get(key)
+        if isinstance(val, (list, tuple)) and val and all(torch.is_tensor(x) for x in val):
+            coarse = val[0]
+            refined = val[-1] if len(val) > 1 else None
+            return coarse, refined
+
+    coarse = (
+        outputs.get("logits_coarse")
+        or outputs.get("coarse_logits")
+        or outputs.get("ctc_logits")
+        or outputs.get("logits")
+    )
+    refined = (
+        outputs.get("logits_refined")
+        or outputs.get("refined_logits")
+        or outputs.get("logits_final")
+        or outputs.get("final_logits")
+    )
+    coarse = coarse if torch.is_tensor(coarse) else None
+    refined = refined if torch.is_tensor(refined) else None
+    return coarse, refined
+
+
+def _extract_seq_logits(outputs: dict) -> torch.Tensor | None:
+    for key in ("seq_logits", "refine_seq_logits", "refined_seq_logits", "decoder_logits"):
+        val = outputs.get(key)
+        if torch.is_tensor(val):
+            return val
+    struct = outputs.get("refine")
+    if isinstance(struct, dict):
+        val = struct.get("seq_logits")
+        if torch.is_tensor(val):
+            return val
+    return None
+
+
+def _extract_aux_losses(outputs: dict) -> torch.Tensor:
+    aux_total = None
+    for key in ("aux_loss", "moe_aux_loss", "router_aux_loss", "load_balance_loss", "lb_loss"):
+        val = outputs.get(key)
+        if torch.is_tensor(val):
+            aux_total = val if aux_total is None else (aux_total + val)
+    val = outputs.get("aux_losses")
+    if isinstance(val, dict):
+        for v in val.values():
+            if torch.is_tensor(v):
+                aux_total = v if aux_total is None else (aux_total + v)
+    elif isinstance(val, (list, tuple)):
+        for v in val:
+            if torch.is_tensor(v):
+                aux_total = v if aux_total is None else (aux_total + v)
+    if aux_total is None:
+        return torch.tensor(0.0)
+    return aux_total
+
+
+def _forward_model(model, images: torch.Tensor, batch: dict, tokenizer: CharTokenizer, refine_steps: int | None):
+    """Call model with optional supervision kwargs if its forward() supports them."""
+    kwargs = {}
+    try:
+        sig = inspect.signature(model.forward)
+        params = sig.parameters
+    except Exception:
+        params = {}
+
+    def _maybe(name: str, value):
+        if name in params:
+            kwargs[name] = value
+
+    # Common names used by research-y models.
+    _maybe("labels", batch.get("labels"))
+    _maybe("label_lengths", batch.get("label_lengths"))
+    _maybe("seq_labels", batch.get("seq_labels"))
+    _maybe("seq_label_lengths", batch.get("seq_label_lengths"))
+    _maybe("struct_targets", batch.get("struct"))
+    _maybe("struct", batch.get("struct"))
+    _maybe("tokenizer", tokenizer)
+    if refine_steps is not None:
+        _maybe("refine_steps", refine_steps)
+        _maybe("num_refine_steps", refine_steps)
+
+    return model(images, **kwargs)
+
+
+def _to_device_struct(struct: object, device: torch.device) -> object:
+    if not isinstance(struct, dict):
+        return struct
+    out: dict = {}
+    for k, v in struct.items():
+        if torch.is_tensor(v):
+            out[k] = v.to(device, non_blocking=True)
+        else:
+            out[k] = v
+    return out
+
+
+def _structure_losses_from_outputs(outputs: dict, batch: dict) -> tuple[torch.Tensor, dict[str, float]]:
+    """Compute dense structure losses when available."""
+    struct_tgt = batch.get("struct")
+    if not isinstance(struct_tgt, dict):
+        return torch.tensor(0.0), {}
+
+    valid = struct_tgt.get("valid")
+    if not torch.is_tensor(valid):
+        return torch.tensor(0.0), {}
+    pred_device = None
+    for v in outputs.values():
+        if torch.is_tensor(v):
+            pred_device = v.device
+            break
+    struct_pred_device = None
+    if pred_device is None and isinstance(outputs.get("struct"), dict):
+        for v in outputs["struct"].values():
+            if torch.is_tensor(v):
+                struct_pred_device = v.device
+                break
+    device = pred_device or struct_pred_device or valid.device
+    valid_f = valid.to(dtype=torch.float32, device=device)
+    denom = valid_f.sum().clamp(min=1.0)
+
+    # Find predicted struct dict or flat keys.
+    struct_pred = outputs.get("struct")
+    if not isinstance(struct_pred, dict):
+        struct_pred = outputs
+
+    losses: dict[str, torch.Tensor] = {}
+    stats: dict[str, float] = {}
+
+    def _masked_mean(loss_map: torch.Tensor) -> torch.Tensor:
+        # Reduce per-sample then mask.
+        per = loss_map.view(loss_map.shape[0], -1).mean(dim=1)
+        return (per * valid_f).sum() / denom
+
+    # Heatmaps: BCEWithLogits vs [0,1] targets.
+    for name, pred_keys, tgt_key in (
+        ("text_mask", ("text_mask_logits", "mask_logits", "text_mask_logit"), "text_mask"),
+        ("baseline", ("baseline_heatmap_logits", "baseline_logits", "baseline_logit"), "baseline_heatmap"),
+        ("char_centers", ("char_center_heatmap_logits", "char_heatmap_logits", "centers_logits"), "char_center_heatmap"),
+    ):
+        pred = None
+        for k in pred_keys:
+            v = struct_pred.get(k)
+            if torch.is_tensor(v):
+                pred = v
+                break
+        if pred is None:
+            continue
+        tgt = struct_tgt.get(tgt_key)
+        if not torch.is_tensor(tgt):
+            continue
+        if pred.ndim == 3:
+            pred = pred.unsqueeze(1)
+        if tgt.ndim == 3:
+            tgt = tgt.unsqueeze(1)
+        if pred.shape[-2:] != tgt.shape[-2:]:
+            tgt = F.interpolate(tgt.to(dtype=torch.float32), size=pred.shape[-2:], mode="bilinear", align_corners=False)
+        loss_map = F.binary_cross_entropy_with_logits(pred, tgt.to(device=pred.device, dtype=pred.dtype), reduction="none")
+        losses[name] = _masked_mean(loss_map)
+
+    # Density: L1 regression.
+    density_pred = None
+    for k in ("density_logits", "density_pred", "density"):
+        v = struct_pred.get(k)
+        if torch.is_tensor(v):
+            density_pred = v
+            break
+    if density_pred is not None:
+        tgt = struct_tgt.get("density")
+        if torch.is_tensor(tgt):
+            if density_pred.ndim == 3 and density_pred.shape[1] == 1:
+                density_pred = density_pred.squeeze(1)
+            if density_pred.ndim == 2 and tgt.ndim == 2 and density_pred.shape[1] != tgt.shape[1]:
+                tgt_1d = tgt.unsqueeze(1)
+                tgt_1d = F.interpolate(tgt_1d, size=density_pred.shape[1], mode="linear", align_corners=False).squeeze(1)
+            else:
+                tgt_1d = tgt
+            l1 = F.l1_loss(density_pred.to(dtype=torch.float32), tgt_1d.to(device=density_pred.device, dtype=torch.float32), reduction="none")
+            losses["density"] = (l1.mean(dim=1) * valid_f).sum() / denom
+
+    if not losses:
+        return torch.tensor(0.0), {}
+
+    total = sum(losses.values())
+    for k, v in losses.items():
+        stats[f"struct/{k}"] = float(v.detach().cpu().item())
+    return total, stats
+
+
 def greedy_decode(logits: torch.Tensor, tokenizer: CharTokenizer) -> list[str]:
     ids = torch.argmax(logits, dim=-1).detach().cpu().tolist()
     return [tokenizer.decode_ctc(row) for row in ids]
+
+
+def pack_sequence_batch(tokenizer: CharTokenizer, texts: list[str], device: torch.device, max_length: int) -> tuple[torch.Tensor, torch.Tensor]:
+    encoded, lengths = tokenizer.batch_encode_sequence(texts, max_length=max_length)
+    padded_len = max([len(seq) for seq in encoded] + [1])
+    padded = torch.full((len(encoded), padded_len), tokenizer.pad_id, dtype=torch.long, device=device)
+    for i, seq in enumerate(encoded):
+        if seq:
+            padded[i, : len(seq)] = torch.tensor(seq, dtype=torch.long, device=device)
+    return padded, torch.tensor(lengths, dtype=torch.long, device=device)
+
+
+def sequence_ce_loss(logits: torch.Tensor, targets: torch.Tensor, pad_id: int) -> torch.Tensor:
+    return F.cross_entropy(logits.reshape(-1, logits.shape[-1]), targets.reshape(-1), ignore_index=pad_id)
+
+
+def pad_sequence_targets(targets: torch.Tensor, pad_id: int, length: int) -> torch.Tensor:
+    if targets.shape[1] == length:
+        return targets
+    padded = torch.full((targets.shape[0], length), pad_id, dtype=targets.dtype, device=targets.device)
+    copy_len = min(length, targets.shape[1])
+    if copy_len > 0:
+        padded[:, :copy_len] = targets[:, :copy_len]
+    return padded
+
+
+def _structure_targets(
+    struct: dict[str, torch.Tensor],
+    target_hw: tuple[int, int],
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    text_mask = struct["text_mask"].to(device)
+    baseline = struct["baseline_heatmap"].to(device)
+    centers = struct["char_center_heatmap"].to(device)
+    density = struct["density"].to(device)
+    valid = struct["valid"].to(device).float()
+
+    text_mask = F.interpolate(text_mask, size=target_hw, mode="bilinear", align_corners=False)
+    baseline = F.interpolate(baseline, size=target_hw, mode="bilinear", align_corners=False)
+    centers = F.interpolate(centers, size=target_hw, mode="bilinear", align_corners=False)
+    density = F.interpolate(density.unsqueeze(1), size=target_hw[1], mode="linear", align_corners=False).squeeze(1)
+    return text_mask, baseline, centers, valid, density
+
+
+def structure_loss(batch_struct: dict[str, torch.Tensor], outputs, device: torch.device) -> tuple[torch.Tensor, dict[str, float]]:
+    if int(batch_struct["valid"].sum().item()) <= 0:
+        zero = outputs.textness_logits.new_tensor(0.0)
+        return zero, {"text_mask": 0.0, "baseline": 0.0, "token_conf": 0.0}
+
+    target_hw = outputs.textness_logits.shape[-2:]
+    text_mask, baseline, centers, valid, density = _structure_targets(batch_struct, target_hw, device)
+    valid_4d = valid[:, None, None, None]
+    valid_1d = valid[:, None]
+
+    text_loss_raw = F.binary_cross_entropy_with_logits(outputs.textness_logits, text_mask, reduction="none")
+    baseline_loss_raw = F.binary_cross_entropy_with_logits(outputs.baseline_logits, baseline, reduction="none")
+    pixel_count = valid_4d.sum().clamp_min(1.0) * text_loss_raw.shape[-1] * text_loss_raw.shape[-2]
+    text_loss = (text_loss_raw * valid_4d).sum() / pixel_count
+    baseline_loss = (baseline_loss_raw * valid_4d).sum() / pixel_count
+
+    token_target = F.interpolate(density.unsqueeze(1), size=outputs.token_confidence.shape[1], mode="linear", align_corners=False).squeeze(1)
+    token_loss_raw = F.binary_cross_entropy_with_logits(outputs.token_confidence.squeeze(-1), token_target, reduction="none")
+    token_loss = (token_loss_raw * valid_1d).sum() / (valid_1d.sum().clamp_min(1.0) * token_loss_raw.shape[-1])
+
+    total = text_loss + baseline_loss + 0.5 * token_loss
+    return total, {"text_mask": float(text_loss.item()), "baseline": float(baseline_loss.item()), "token_conf": float(token_loss.item())}
+
+
+def decode_ids_to_texts(tokenizer: CharTokenizer, ids: torch.Tensor, mode: str) -> list[str]:
+    rows = ids.detach().cpu().tolist()
+    if mode == "ctc":
+        return [tokenizer.decode_ctc(row) for row in rows]
+    return [tokenizer.decode_sequence(row) for row in rows]
 
 
 def edit_distance(a: str, b: str) -> int:
@@ -212,6 +491,13 @@ def main():
     ap.add_argument("--epochs", type=int, default=6)
     ap.add_argument("--batch-size", type=int, default=0, help="0 = auto-scale from detected GPU VRAM")
     ap.add_argument("--lr", type=float, default=3e-4)
+    ap.add_argument("--refine-steps", type=int, default=2, help="Iterative refinement steps (if supported by model)")
+    ap.add_argument("--ctc-coarse-weight", type=float, default=1.0)
+    ap.add_argument("--ctc-refine-weight", type=float, default=1.0)
+    ap.add_argument("--seq-refine-weight", type=float, default=0.0, help="Cross-entropy loss on seq logits (if model returns them)")
+    ap.add_argument("--struct-weight", type=float, default=0.2, help="Weight of structure supervision losses (synthetic-only)")
+    ap.add_argument("--aux-weight", type=float, default=0.05, help="Weight for routing/load-balance aux losses")
+    ap.add_argument("--grad-clip", type=float, default=1.0, help="0 disables gradient clipping")
     ap.add_argument("--image-height", type=int, default=64)
     ap.add_argument("--image-width", type=int, default=512)
     ap.add_argument("--synthetic-samples", type=int, default=40000)
@@ -268,7 +554,18 @@ def main():
     train_loader, val_loader, dataset_summary = build_dataloaders(tokenizer, data_cfg)
     _print_dataset_summary(dataset_summary)
 
-    model_cfg = StrideMoEConfig(vocab_size=len(tokenizer.itos), dim=256, depth=6, heads=8, num_experts=8, top_k=2)
+    model_cfg = StrideMoEConfig(
+        vocab_size=len(tokenizer.itos),
+        dim=256,
+        depth=6,
+        heads=8,
+        num_experts=8,
+        top_k=2,
+        local_depth=3,
+        refine_depth=4,
+        refine_iters=2,
+        max_refine_len=data_cfg.max_label_len + 2,
+    )
     model = StrideMoEOCR(model_cfg)
     if device.type == "cuda":
         model = model.to(device=device, memory_format=torch.channels_last)
@@ -295,25 +592,59 @@ def main():
                 images = images.contiguous(memory_format=torch.channels_last)
             labels = batch["labels"].to(device, non_blocking=True)
             label_lengths = batch["label_lengths"].to(device, non_blocking=True)
+            seq_labels = pad_sequence_targets(
+                batch["seq_labels"].to(device, non_blocking=True),
+                tokenizer.pad_id,
+                model_cfg.max_refine_len,
+            )
 
             optimizer.zero_grad(set_to_none=True)
             with torch.autocast(**autocast_kwargs):
-                logits, aux_loss = model(images)
-                ctc = ctc_loss_from_logits(logits, labels, label_lengths, tokenizer.blank_id)
-                loss = ctc + 0.05 * aux_loss
+                outputs = model(images)
+                ctc = ctc_loss_from_logits(outputs.coarse_logits, labels, label_lengths, tokenizer.blank_id)
+
+                coarse_texts = decode_ids_to_texts(tokenizer, outputs.coarse_pred_ids, "ctc")
+                refine_source_ids, _ = pack_sequence_batch(tokenizer, coarse_texts, device, model_cfg.max_refine_len)
+                refine_logits_1, refine_aux_1 = model.refiner(
+                    outputs.memory.tokens,
+                    refine_source_ids,
+                    source_quality=outputs.coarse_quality,
+                )
+                refine_loss_1 = sequence_ce_loss(refine_logits_1, seq_labels, tokenizer.pad_id)
+
+                refine_loss = refine_loss_1
+                refine_aux = refine_aux_1
+                final_refine_logits = refine_logits_1
+                if model_cfg.refine_iters > 1:
+                    refine_texts = decode_ids_to_texts(tokenizer, refine_logits_1.argmax(dim=-1), "sequence")
+                    refine_source_ids_2, _ = pack_sequence_batch(tokenizer, refine_texts, device, model_cfg.max_refine_len)
+                    refine_logits_2, refine_aux_2 = model.refiner(
+                        outputs.memory.tokens,
+                        refine_source_ids_2,
+                        source_quality=outputs.coarse_quality,
+                    )
+                    refine_loss_2 = sequence_ce_loss(refine_logits_2, seq_labels, tokenizer.pad_id)
+                    refine_loss = 0.5 * refine_loss_1 + refine_loss_2
+                    refine_aux = {key: refine_aux_1[key] + refine_aux_2[key] for key in refine_aux_1}
+                    final_refine_logits = refine_logits_2
+
+                struct_loss, _ = structure_loss(batch["struct"], outputs.structure, device)
+                moe_aux = outputs.coarse_aux["aux"] + refine_aux["aux"]
+                loss = ctc + 0.75 * refine_loss + 0.15 * struct_loss + 0.02 * moe_aux
 
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
 
             train_loss += float(loss.item())
-            pbar.set_postfix(loss=f"{loss.item():.4f}")
+            pbar.set_postfix(loss=f"{loss.item():.4f}", ctc=f"{ctc.item():.4f}", refine=f"{refine_loss.item():.4f}")
 
         train_loss /= max(1, len(train_loader))
 
         model.eval()
         val_loss = 0.0
-        cers = []
+        coarse_cers = []
+        refine_cers = []
         preview_payload: tuple[list[Image.Image], list[str], list[str]] | None = None
         with torch.inference_mode():
             for batch in tqdm(val_loader, desc=f"epoch {epoch} val"):
@@ -322,27 +653,65 @@ def main():
                     images = images.contiguous(memory_format=torch.channels_last)
                 labels = batch["labels"].to(device, non_blocking=True)
                 label_lengths = batch["label_lengths"].to(device, non_blocking=True)
+                seq_labels = pad_sequence_targets(
+                    batch["seq_labels"].to(device, non_blocking=True),
+                    tokenizer.pad_id,
+                    model_cfg.max_refine_len,
+                )
 
                 with torch.autocast(**autocast_kwargs):
-                    logits, aux_loss = model(images)
-                    ctc = ctc_loss_from_logits(logits, labels, label_lengths, tokenizer.blank_id)
-                    loss = ctc + 0.05 * aux_loss
+                    outputs = model(images)
+                    ctc = ctc_loss_from_logits(outputs.coarse_logits, labels, label_lengths, tokenizer.blank_id)
+                    coarse_texts = decode_ids_to_texts(tokenizer, outputs.coarse_pred_ids, "ctc")
+                    refine_source_ids, _ = pack_sequence_batch(tokenizer, coarse_texts, device, model_cfg.max_refine_len)
+                    refine_logits_1, refine_aux_1 = model.refiner(
+                        outputs.memory.tokens,
+                        refine_source_ids,
+                        source_quality=outputs.coarse_quality,
+                    )
+                    refine_loss_1 = sequence_ce_loss(refine_logits_1, seq_labels, tokenizer.pad_id)
+                    refine_texts = decode_ids_to_texts(tokenizer, refine_logits_1.argmax(dim=-1), "sequence")
+
+                    refine_loss = refine_loss_1
+                    refine_aux = refine_aux_1
+                    final_refine_logits = refine_logits_1
+                    if model_cfg.refine_iters > 1:
+                        refine_source_ids_2, _ = pack_sequence_batch(tokenizer, refine_texts, device, model_cfg.max_refine_len)
+                        refine_logits_2, refine_aux_2 = model.refiner(
+                            outputs.memory.tokens,
+                            refine_source_ids_2,
+                            source_quality=outputs.coarse_quality,
+                        )
+                        refine_loss_2 = sequence_ce_loss(refine_logits_2, seq_labels, tokenizer.pad_id)
+                        refine_loss = 0.5 * refine_loss_1 + refine_loss_2
+                        refine_aux = {key: refine_aux_1[key] + refine_aux_2[key] for key in refine_aux_1}
+                        final_refine_logits = refine_logits_2
+
+                    struct_loss, _ = structure_loss(batch["struct"], outputs.structure, device)
+                    moe_aux = outputs.coarse_aux["aux"] + refine_aux["aux"]
+                    loss = ctc + 0.75 * refine_loss + 0.15 * struct_loss + 0.02 * moe_aux
                 val_loss += float(loss.item())
 
-                preds = greedy_decode(logits, tokenizer)
-                for pred, ref in zip(preds, batch["texts"]):
-                    cers.append(cer(pred, ref))
+                coarse_preds = decode_ids_to_texts(tokenizer, outputs.coarse_pred_ids, "ctc")
+                final_preds = decode_ids_to_texts(tokenizer, final_refine_logits.argmax(dim=-1), "sequence")
+                for coarse_pred, final_pred, ref in zip(coarse_preds, final_preds, batch["texts"]):
+                    coarse_cers.append(cer(coarse_pred, ref))
+                    refine_cers.append(cer(final_pred, ref))
 
                 if preview_payload is None:
                     preview_payload = (
                         batch["preview_images"][: args.preview_count],
                         batch["texts"][: args.preview_count],
-                        preds[: args.preview_count],
+                        final_preds[: args.preview_count],
                     )
 
         val_loss /= max(1, len(val_loader))
-        mean_cer = sum(cers) / max(1, len(cers))
-        print(f"epoch={epoch} train_loss={train_loss:.4f} val_loss={val_loss:.4f} val_CER={mean_cer:.4f}")
+        mean_coarse_cer = sum(coarse_cers) / max(1, len(coarse_cers))
+        mean_refine_cer = sum(refine_cers) / max(1, len(refine_cers))
+        print(
+            f"epoch={epoch} train_loss={train_loss:.4f} val_loss={val_loss:.4f} "
+            f"coarse_CER={mean_coarse_cer:.4f} refine_CER={mean_refine_cer:.4f}"
+        )
 
         if preview_payload is not None:
             preview_path = preview_dir / f"epoch_{epoch:03d}.png"
@@ -358,7 +727,8 @@ def main():
             "config": model_cfg.__dict__,
             "epoch": epoch,
             "val_loss": val_loss,
-            "val_cer": mean_cer,
+            "val_coarse_cer": mean_coarse_cer,
+            "val_refine_cer": mean_refine_cer,
             "dataset_summary": dataset_summary,
         }
         torch.save(ckpt, output_dir / "last.pt")
@@ -372,7 +742,16 @@ def main():
     dummy = torch.randn(1, 1, args.image_height, args.image_width, device=device)
     if device.type == "cuda":
         dummy = dummy.contiguous(memory_format=torch.channels_last)
-    traced = torch.jit.trace(model, dummy)
+
+    class CoarseExport(nn.Module):
+        def __init__(self, source_model: StrideMoEOCR):
+            super().__init__()
+            self.source_model = source_model
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            return self.source_model.coarse_only(x)
+
+    traced = torch.jit.trace(CoarseExport(model).eval(), dummy, check_trace=False)
     traced.save(str(output_dir / "model_ts.pt"))
 
     with open(output_dir / "train_meta.json", "w", encoding="utf-8") as f:

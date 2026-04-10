@@ -1,12 +1,22 @@
 # ITTAMT — STRIDE-MoE OCR
 
 Research-oriented image-to-text OCR system with a custom **STRIDE-MoE** architecture:
-- convolutional local visual stem,
-- transformer sequence encoder,
-- sparse Mixture-of-Experts feed-forward routing,
-- CTC decoding head for fast inference.
+- genuine 2D visual tokenization over the image grid,
+- dual-path encoder with local 2D blocks and a global sequence path,
+- context-aware sparse Mixture-of-Experts routing,
+- structure heads for text-region and baseline supervision,
+- iterative coarse-to-refine decoding for the final transcription.
 
 The project is optimized for Google Colab training and fast macOS inference.
+
+## Current model flow
+
+1. the image is normalized and turned into a 2D feature grid,
+2. the encoder processes local layout and long-range context in parallel,
+3. the coarse branch predicts CTC logits over characters,
+4. the first coarse decode is re-encoded,
+5. the refinement decoder edits the coarse text using the visual memory,
+6. structure heads learn text-region and baseline geometry from synthetic samples.
 
 ## Quick start (single-script flow for Colab)
 
@@ -20,9 +30,9 @@ That one script does all of this:
 1. installs dependencies,
 2. auto-downloads a mixed OCR training set when available,
 3. generates structured synthetic OCR data automatically,
-4. trains the model,
+4. trains the model with CTC, refinement, and structure losses,
 5. saves validation previews with reference and predicted text,
-6. exports checkpoints and TorchScript artifact.
+6. exports checkpoints and a coarse TorchScript artifact.
 
 Artifacts are saved by default outside the repo in Colab under `/content/ittamt_artifacts/stride_moe/`.
 Dataset caches are saved outside the repo in Colab under `/content/ittamt_datasets/`.
@@ -55,7 +65,7 @@ Each epoch now saves a preview image under the active output directory, typicall
 
 - the validation image sample,
 - the ground-truth text,
-- the model prediction.
+- the refined model prediction.
 
 The training script also prints a few `sample[i] ref=...` and `sample[i] pred=...` lines into the Colab log for quick inspection.
 
@@ -98,9 +108,9 @@ python scripts/infer.py --screenshot --image capture.png
 ## Files
 
 - `scripts/train_colab.py`: end-to-end training entrypoint.
-- `scripts/infer.py`: fast inference from file or screenshot.
-- `src/ittamt/model.py`: STRIDE-MoE model.
-- `src/ittamt/data.py`: dataset auto-loading + synthetic generation.
+- `scripts/infer.py`: coarse-to-refine inference from file or screenshot.
+- `src/ittamt/model.py`: dual-path STRIDE-MoE OCR model with refinement and structure heads.
+- `src/ittamt/data.py`: dataset auto-loading, structured synthetic generation, and OCR crop conversion.
 - `src/ittamt/tokenizer.py`: char-level tokenizer + CTC decode.
 
 ## Next upgrades

@@ -40,6 +40,23 @@ def greedy_decode(ids: list[int], tokenizer: CharTokenizer) -> str:
     return tokenizer.decode_ctc(ids)
 
 
+def pack_sequence_batch(tokenizer: CharTokenizer, texts: list[str], device: torch.device, max_length: int) -> torch.Tensor:
+    encoded, _ = tokenizer.batch_encode_sequence(texts, max_length=max_length)
+    padded_len = max([len(seq) for seq in encoded] + [1])
+    padded = torch.full((len(encoded), padded_len), tokenizer.pad_id, dtype=torch.long, device=device)
+    for i, seq in enumerate(encoded):
+        if seq:
+            padded[i, : len(seq)] = torch.tensor(seq, dtype=torch.long, device=device)
+    return padded
+
+
+def decode_ids_to_texts(tokenizer: CharTokenizer, ids: torch.Tensor, mode: str) -> list[str]:
+    rows = ids.detach().cpu().tolist()
+    if mode == "ctc":
+        return [tokenizer.decode_ctc(row) for row in rows]
+    return [tokenizer.decode_sequence(row) for row in rows]
+
+
 def get_device() -> torch.device:
     if torch.cuda.is_available():
         return torch.device("cuda")
@@ -79,10 +96,20 @@ def main():
 
     x = load_image(args.image, args.width, args.height).to(device)
     with torch.no_grad():
-        logits, _ = model(x)
-        ids = torch.argmax(logits, dim=-1)[0].detach().cpu().tolist()
-        text = greedy_decode(ids, tokenizer)
-    print(text)
+        outputs = model(x)
+        coarse_text = decode_ids_to_texts(tokenizer, outputs.coarse_pred_ids, "ctc")[0]
+
+        source_ids = pack_sequence_batch(tokenizer, [coarse_text], device, model.cfg.max_refine_len)
+        refine_logits, _ = model.refiner(outputs.memory.tokens, source_ids, source_quality=outputs.coarse_quality)
+        refine_text = decode_ids_to_texts(tokenizer, refine_logits.argmax(dim=-1), "sequence")[0]
+
+        if model.cfg.refine_iters > 1:
+            source_ids_2 = pack_sequence_batch(tokenizer, [refine_text], device, model.cfg.max_refine_len)
+            refine_logits_2, _ = model.refiner(outputs.memory.tokens, source_ids_2, source_quality=outputs.coarse_quality)
+            refine_text = decode_ids_to_texts(tokenizer, refine_logits_2.argmax(dim=-1), "sequence")[0]
+
+    print(f"coarse: {coarse_text}")
+    print(f"refined: {refine_text}")
 
 
 if __name__ == "__main__":

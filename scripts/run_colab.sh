@@ -25,5 +25,6 @@ python scripts/train_colab.py \
   --num-workers "${NUM_WORKERS:-8}" \
   --prefetch-factor "${PREFETCH_FACTOR:-4}" \
   --synthetic-samples "${SYNTHETIC_SAMPLES:-40000}" \
+  --synthetic-val-samples "${SYNTHETIC_VAL_SAMPLES:-3000}" \
   --dataset-cache-dir "$HF_DATASETS_CACHE" \
   --output-dir "$OUTPUT_DIR"

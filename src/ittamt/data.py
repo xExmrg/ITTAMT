@@ -11,7 +11,7 @@ from typing import Any
 import numpy as np
 import torch
 from datasets import load_dataset
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFilter, ImageFont
 from torch.utils.data import DataLoader, Dataset
 
 from .tokenizer import CharTokenizer
