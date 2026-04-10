@@ -1,0 +1,16 @@
+model:
+  dim: 256
+  depth: 6
+  heads: 8
+  num_experts: 8
+  top_k: 2
+
+data:
+  image_height: 64
+  image_width: 512
+  synthetic_samples: 40000
+
+train:
+  epochs: 6
+  batch_size: 16
+  lr: 3e-4
