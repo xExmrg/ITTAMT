@@ -25,6 +25,7 @@ That one script does all of this:
 6. exports checkpoints and TorchScript artifact.
 
 Artifacts are saved by default in `artifacts/stride_moe/`.
+Dataset caches are stored outside the repo by default in Colab under `/content/ittamt_datasets/`.
 
 ## Training data mix
 
@@ -52,10 +53,19 @@ The training script also prints a few `sample[i] ref=...` and `sample[i] pred=..
 ## Colab notes
 
 - Recommended GPU: **H100** (best), **A100** (great), otherwise any CUDA GPU works.
+- `scripts/train_colab.py` now requires CUDA by default, so Colab will fail fast instead of silently training on CPU.
+- `BATCH_SIZE=0` auto-scales from detected GPU VRAM. On large cards it will pick a much larger batch than the old fixed default.
+- Hugging Face dataset cache defaults to `/content/ittamt_datasets/`, so the git checkout stays smaller and easier to throw away.
 - For free/limited Colab, reduce workload:
 
 ```bash
 EPOCHS=2 BATCH_SIZE=8 SYNTHETIC_SAMPLES=12000 bash scripts/run_colab.sh
+```
+
+For high-VRAM Colab instances, leaving `BATCH_SIZE=0` is usually the right choice. If you want to override it manually:
+
+```bash
+BATCH_SIZE=128 NUM_WORKERS=4 DATASET_CACHE_DIR=/content/ittamt_datasets bash scripts/run_colab.sh
 ```
 
 You can also reduce preview output volume:

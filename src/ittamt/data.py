@@ -24,6 +24,9 @@ class DataConfig:
     max_label_len: int = 128
     batch_size: int = 16
     num_workers: int = 2
+    prefetch_factor: int = 2
+    pin_memory: bool = True
+    dataset_cache_dir: str | None = None
     synthetic_samples: int = 60000
     synthetic_val_samples: int = 3000
     use_synthetic: bool = True
@@ -274,6 +277,7 @@ def _load_first_available_direct(
     cap: int,
     summary: dict[str, Any],
     summary_name: str,
+    cache_dir: str | None = None,
 ) -> list[Sample]:
     split_map = {
         "train": "train",
@@ -283,7 +287,7 @@ def _load_first_available_direct(
     samples: list[Sample] = []
     for dataset_name in dataset_names:
         try:
-            ds = load_dataset(dataset_name, split=split_map[split])
+            ds = load_dataset(dataset_name, split=split_map[split], cache_dir=cache_dir)
             for example in ds:
                 text = _normalize_text(_safe_get_text(example), preserve_newlines=True)
                 image = _safe_get_image(example)
@@ -300,22 +304,36 @@ def _load_first_available_direct(
     return samples
 
 
-def load_iam_split(split: str, cap: int, summary: dict[str, Any]) -> list[Sample]:
+def load_iiit5k_split(split: str, cap: int, summary: dict[str, Any], cache_dir: str | None = None) -> list[Sample]:
+    resolved_split = "test" if split == "validation" else split
+    return _load_first_available_direct(
+        ["MiXaiLL76/IIIT5K_OCR"],
+        resolved_split,
+        cap,
+        summary,
+        "iiit5k",
+        cache_dir=cache_dir,
+    )
+
+
+def load_iam_split(split: str, cap: int, summary: dict[str, Any], cache_dir: str | None = None) -> list[Sample]:
     dataset_names = ["Teklia/IAM-line", "Teklia/IAM-lines", "LarsHill/IAM-lines"]
     resolved_split = "validation" if split == "validation" else split
-    return _load_first_available_direct(dataset_names, resolved_split, cap, summary, "iam")
+    return _load_first_available_direct(
+        dataset_names,
+        resolved_split,
+        cap,
+        summary,
+        "iam",
+        cache_dir=cache_dir,
+    )
 
 
-def load_iiit5k_split(split: str, cap: int, summary: dict[str, Any]) -> list[Sample]:
-    resolved_split = "test" if split == "validation" else split
-    return _load_first_available_direct(["MiXaiLL76/IIIT5K_OCR"], resolved_split, cap, summary, "iiit5k")
-
-
-def load_sroie_split(split: str, cap: int, summary: dict[str, Any]) -> list[Sample]:
+def load_sroie_split(split: str, cap: int, summary: dict[str, Any], cache_dir: str | None = None) -> list[Sample]:
     dataset_name = "jsdnrs/ICDAR2019-SROIE"
     resolved_split = "test" if split == "validation" else split
     try:
-        ds = load_dataset(dataset_name, split=resolved_split)
+        ds = load_dataset(dataset_name, split=resolved_split, cache_dir=cache_dir)
         samples: list[Sample] = []
         for example in ds:
             image = _safe_get_image(example)
@@ -338,10 +356,10 @@ def load_sroie_split(split: str, cap: int, summary: dict[str, Any]) -> list[Samp
         return []
 
 
-def load_cord_split(split: str, cap: int, summary: dict[str, Any]) -> list[Sample]:
+def load_cord_split(split: str, cap: int, summary: dict[str, Any], cache_dir: str | None = None) -> list[Sample]:
     dataset_name = "naver-clova-ix/cord-v2"
     try:
-        ds = load_dataset(dataset_name, split=split)
+        ds = load_dataset(dataset_name, split=split, cache_dir=cache_dir)
         samples: list[Sample] = []
         for example in ds:
             image = _safe_get_image(example)
@@ -380,11 +398,11 @@ def load_cord_split(split: str, cap: int, summary: dict[str, Any]) -> list[Sampl
         return []
 
 
-def load_funsd_split(split: str, cap: int, summary: dict[str, Any]) -> list[Sample]:
+def load_funsd_split(split: str, cap: int, summary: dict[str, Any], cache_dir: str | None = None) -> list[Sample]:
     dataset_name = "nielsr/funsd"
     resolved_split = "test" if split == "validation" else split
     try:
-        ds = load_dataset(dataset_name, split=resolved_split)
+        ds = load_dataset(dataset_name, split=resolved_split, cache_dir=cache_dir)
         samples: list[Sample] = []
         for example in ds:
             image = _safe_get_image(example)
@@ -421,24 +439,24 @@ def build_dataloaders(tokenizer: CharTokenizer, cfg: DataConfig):
         _record_count(summary, "validation", "synthetic", len(synthetic_val))
 
     if cfg.use_iam:
-        train_samples.extend(load_iam_split("train", cfg.iam_train_cap, summary))
-        val_samples.extend(load_iam_split("validation", cfg.iam_val_cap, summary))
+        train_samples.extend(load_iam_split("train", cfg.iam_train_cap, summary, cache_dir=cfg.dataset_cache_dir))
+        val_samples.extend(load_iam_split("validation", cfg.iam_val_cap, summary, cache_dir=cfg.dataset_cache_dir))
 
     if cfg.use_iiit5k:
-        train_samples.extend(load_iiit5k_split("train", cfg.iiit5k_train_cap, summary))
-        val_samples.extend(load_iiit5k_split("validation", cfg.iiit5k_val_cap, summary))
+        train_samples.extend(load_iiit5k_split("train", cfg.iiit5k_train_cap, summary, cache_dir=cfg.dataset_cache_dir))
+        val_samples.extend(load_iiit5k_split("validation", cfg.iiit5k_val_cap, summary, cache_dir=cfg.dataset_cache_dir))
 
     if cfg.use_sroie:
-        train_samples.extend(load_sroie_split("train", cfg.sroie_train_cap, summary))
-        val_samples.extend(load_sroie_split("validation", cfg.sroie_val_cap, summary))
+        train_samples.extend(load_sroie_split("train", cfg.sroie_train_cap, summary, cache_dir=cfg.dataset_cache_dir))
+        val_samples.extend(load_sroie_split("validation", cfg.sroie_val_cap, summary, cache_dir=cfg.dataset_cache_dir))
 
     if cfg.use_cord:
-        train_samples.extend(load_cord_split("train", cfg.cord_train_cap, summary))
-        val_samples.extend(load_cord_split("validation", cfg.cord_val_cap, summary))
+        train_samples.extend(load_cord_split("train", cfg.cord_train_cap, summary, cache_dir=cfg.dataset_cache_dir))
+        val_samples.extend(load_cord_split("validation", cfg.cord_val_cap, summary, cache_dir=cfg.dataset_cache_dir))
 
     if cfg.use_funsd:
-        train_samples.extend(load_funsd_split("train", cfg.funsd_train_cap, summary))
-        val_samples.extend(load_funsd_split("validation", cfg.funsd_val_cap, summary))
+        train_samples.extend(load_funsd_split("train", cfg.funsd_train_cap, summary, cache_dir=cfg.dataset_cache_dir))
+        val_samples.extend(load_funsd_split("validation", cfg.funsd_val_cap, summary, cache_dir=cfg.dataset_cache_dir))
 
     random.shuffle(train_samples)
     random.shuffle(val_samples)
@@ -447,20 +465,25 @@ def build_dataloaders(tokenizer: CharTokenizer, cfg: DataConfig):
     val_ds = OCRDataset(val_samples, tokenizer, cfg)
 
     collate_fn = lambda batch: _collate(batch, pad_id=tokenizer.blank_id)
+    loader_kwargs: dict[str, Any] = {
+        "num_workers": cfg.num_workers,
+        "pin_memory": cfg.pin_memory,
+        "collate_fn": collate_fn,
+    }
+    if cfg.num_workers > 0:
+        loader_kwargs["persistent_workers"] = True
+        loader_kwargs["prefetch_factor"] = max(2, cfg.prefetch_factor)
+
     train_loader = DataLoader(
         train_ds,
         batch_size=cfg.batch_size,
         shuffle=True,
-        num_workers=cfg.num_workers,
-        pin_memory=True,
-        collate_fn=collate_fn,
+        **loader_kwargs,
     )
     val_loader = DataLoader(
         val_ds,
         batch_size=cfg.batch_size,
         shuffle=False,
-        num_workers=cfg.num_workers,
-        pin_memory=True,
-        collate_fn=collate_fn,
+        **loader_kwargs,
     )
     return train_loader, val_loader, summary
