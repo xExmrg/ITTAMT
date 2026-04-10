@@ -84,6 +84,63 @@ def get_device() -> torch.device:
     return torch.device("cpu")
 
 
+def running_in_colab() -> bool:
+    return "COLAB_GPU" in os.environ or Path("/content").exists()
+
+
+def default_dataset_cache_dir() -> str:
+    if running_in_colab():
+        return "/content/ittamt_datasets"
+    return str(Path.home() / ".cache" / "ittamt_datasets")
+
+
+def default_output_dir() -> str:
+    if running_in_colab():
+        return "/content/ittamt_artifacts/stride_moe"
+    return "artifacts/stride_moe"
+
+
+def resolve_batch_size(requested_batch_size: int, device: torch.device) -> tuple[int, str]:
+    if requested_batch_size > 0:
+        return requested_batch_size, "manual"
+    if device.type != "cuda":
+        return 16, "cpu-safe default"
+
+    total_gb = torch.cuda.get_device_properties(device).total_memory / (1024**3)
+    if total_gb >= 120:
+        return 256, "auto(>=120GB VRAM)"
+    if total_gb >= 90:
+        return 192, "auto(>=90GB VRAM)"
+    if total_gb >= 80:
+        return 160, "auto(>=80GB VRAM)"
+    if total_gb >= 48:
+        return 96, "auto(>=48GB VRAM)"
+    if total_gb >= 24:
+        return 48, "auto(>=24GB VRAM)"
+    return 16, "auto(<24GB VRAM)"
+
+
+def configure_cuda_runtime(device: torch.device) -> dict[str, str | float]:
+    runtime: dict[str, str | float] = {"device": str(device)}
+    if device.type != "cuda":
+        return runtime
+
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.set_float32_matmul_precision("high")
+
+    free_bytes, total_bytes = torch.cuda.mem_get_info(device)
+    runtime.update(
+        {
+            "gpu_name": torch.cuda.get_device_name(device),
+            "gpu_total_gb": round(total_bytes / (1024**3), 1),
+            "gpu_free_gb": round(free_bytes / (1024**3), 1),
+        }
+    )
+    return runtime
+
+
 def _format_preview_text(label: str, value: str, width: int = 60) -> list[str]:
     normalized = value.replace("\n", " | ")
     wrapped = textwrap.wrap(f"{label}: {normalized}", width=width) or [f"{label}: "]
@@ -153,26 +210,58 @@ def _print_dataset_summary(summary: dict[str, dict[str, int] | list[str]]) -> No
 def main():
     ap = argparse.ArgumentParser(description="Train STRIDE-MoE OCR on Colab")
     ap.add_argument("--epochs", type=int, default=6)
-    ap.add_argument("--batch-size", type=int, default=16)
+    ap.add_argument("--batch-size", type=int, default=0, help="0 = auto-scale from detected GPU VRAM")
     ap.add_argument("--lr", type=float, default=3e-4)
     ap.add_argument("--image-height", type=int, default=64)
     ap.add_argument("--image-width", type=int, default=512)
     ap.add_argument("--synthetic-samples", type=int, default=40000)
     ap.add_argument("--synthetic-val-samples", type=int, default=3000)
-    ap.add_argument("--num-workers", type=int, default=2)
+    ap.add_argument("--num-workers", type=int, default=8)
+    ap.add_argument("--prefetch-factor", type=int, default=4)
     ap.add_argument("--preview-count", type=int, default=4)
-    ap.add_argument("--output-dir", type=str, default="artifacts/stride_moe")
+    ap.add_argument("--dataset-cache-dir", type=str, default=None)
+    ap.add_argument("--allow-non-cuda", action="store_true", help="Allow fallback to CPU/MPS instead of requiring CUDA")
+    ap.add_argument("--output-dir", type=str, default=None)
     args = ap.parse_args()
 
-    os.makedirs(args.output_dir, exist_ok=True)
+    device = get_device()
+    if device.type != "cuda" and not args.allow_non_cuda:
+        raise RuntimeError(
+            "train_colab.py requires a CUDA GPU by default. "
+            "In Colab, switch Runtime -> Change runtime type -> GPU. "
+            "For local debugging only, pass --allow-non-cuda."
+        )
+
+    runtime_info = configure_cuda_runtime(device)
+    batch_size, batch_size_mode = resolve_batch_size(args.batch_size, device)
+    dataset_cache_dir = Path(args.dataset_cache_dir or default_dataset_cache_dir()).resolve()
+    dataset_cache_dir.mkdir(parents=True, exist_ok=True)
+    output_dir = Path(args.output_dir or default_output_dir()).resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    print("runtime config:")
+    print(f"  device: {runtime_info['device']}")
+    if device.type == "cuda":
+        print(f"  gpu: {runtime_info['gpu_name']}")
+        print(f"  gpu_vram_total_gb: {runtime_info['gpu_total_gb']}")
+        print(f"  gpu_vram_free_gb: {runtime_info['gpu_free_gb']}")
+    print(f"  batch_size: {batch_size} ({batch_size_mode})")
+    print(f"  num_workers: {args.num_workers}")
+    print(f"  prefetch_factor: {args.prefetch_factor}")
+    print(f"  dataset_cache_dir: {dataset_cache_dir}")
+    print(f"  output_dir: {output_dir}")
+
     tokenizer = CharTokenizer.build_default()
-    tokenizer.save(str(Path(args.output_dir) / "tokenizer.json"))
+    tokenizer.save(str(output_dir / "tokenizer.json"))
 
     data_cfg = DataConfig(
         image_height=args.image_height,
         image_width=args.image_width,
-        batch_size=args.batch_size,
+        batch_size=batch_size,
         num_workers=args.num_workers,
+        prefetch_factor=args.prefetch_factor,
+        pin_memory=device.type == "cuda",
+        dataset_cache_dir=str(dataset_cache_dir),
         synthetic_samples=args.synthetic_samples,
         synthetic_val_samples=args.synthetic_val_samples,
     )
@@ -181,13 +270,19 @@ def main():
 
     model_cfg = StrideMoEConfig(vocab_size=len(tokenizer.itos), dim=256, depth=6, heads=8, num_experts=8, top_k=2)
     model = StrideMoEOCR(model_cfg)
-
-    device = get_device()
-    model.to(device)
+    if device.type == "cuda":
+        model = model.to(device=device, memory_format=torch.channels_last)
+    else:
+        model = model.to(device)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
     scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
-    preview_dir = Path(args.output_dir) / "eval_previews"
+    preview_dir = output_dir / "eval_previews"
+    autocast_kwargs = {
+        "device_type": "cuda" if device.type == "cuda" else "cpu",
+        "dtype": torch.bfloat16,
+        "enabled": device.type == "cuda",
+    }
 
     best_val = float("inf")
     for epoch in range(1, args.epochs + 1):
@@ -196,11 +291,13 @@ def main():
         pbar = tqdm(train_loader, desc=f"epoch {epoch} train")
         for batch in pbar:
             images = batch["image"].to(device, non_blocking=True)
+            if device.type == "cuda":
+                images = images.contiguous(memory_format=torch.channels_last)
             labels = batch["labels"].to(device, non_blocking=True)
             label_lengths = batch["label_lengths"].to(device, non_blocking=True)
 
             optimizer.zero_grad(set_to_none=True)
-            with torch.autocast(device_type=device.type if device.type != "mps" else "cpu", dtype=torch.bfloat16, enabled=device.type == "cuda"):
+            with torch.autocast(**autocast_kwargs):
                 logits, aux_loss = model(images)
                 ctc = ctc_loss_from_logits(logits, labels, label_lengths, tokenizer.blank_id)
                 loss = ctc + 0.05 * aux_loss
@@ -218,15 +315,18 @@ def main():
         val_loss = 0.0
         cers = []
         preview_payload: tuple[list[Image.Image], list[str], list[str]] | None = None
-        with torch.no_grad():
+        with torch.inference_mode():
             for batch in tqdm(val_loader, desc=f"epoch {epoch} val"):
                 images = batch["image"].to(device, non_blocking=True)
+                if device.type == "cuda":
+                    images = images.contiguous(memory_format=torch.channels_last)
                 labels = batch["labels"].to(device, non_blocking=True)
                 label_lengths = batch["label_lengths"].to(device, non_blocking=True)
 
-                logits, aux_loss = model(images)
-                ctc = ctc_loss_from_logits(logits, labels, label_lengths, tokenizer.blank_id)
-                loss = ctc + 0.05 * aux_loss
+                with torch.autocast(**autocast_kwargs):
+                    logits, aux_loss = model(images)
+                    ctc = ctc_loss_from_logits(logits, labels, label_lengths, tokenizer.blank_id)
+                    loss = ctc + 0.05 * aux_loss
                 val_loss += float(loss.item())
 
                 preds = greedy_decode(logits, tokenizer)
@@ -261,26 +361,34 @@ def main():
             "val_cer": mean_cer,
             "dataset_summary": dataset_summary,
         }
-        torch.save(ckpt, Path(args.output_dir) / "last.pt")
+        torch.save(ckpt, output_dir / "last.pt")
 
         if val_loss < best_val:
             best_val = val_loss
-            torch.save(ckpt, Path(args.output_dir) / "best.pt")
+            torch.save(ckpt, output_dir / "best.pt")
 
     # Export TorchScript for macOS-friendly inference
     model.eval()
     dummy = torch.randn(1, 1, args.image_height, args.image_width, device=device)
+    if device.type == "cuda":
+        dummy = dummy.contiguous(memory_format=torch.channels_last)
     traced = torch.jit.trace(model, dummy)
-    traced.save(str(Path(args.output_dir) / "model_ts.pt"))
+    traced.save(str(output_dir / "model_ts.pt"))
 
-    with open(Path(args.output_dir) / "train_meta.json", "w", encoding="utf-8") as f:
+    with open(output_dir / "train_meta.json", "w", encoding="utf-8") as f:
         json.dump(
             {
                 "device": str(device),
+                "batch_size": batch_size,
+                "num_workers": args.num_workers,
+                "prefetch_factor": args.prefetch_factor,
                 "epochs": args.epochs,
                 "best_val": best_val,
+                "dataset_cache_dir": str(dataset_cache_dir),
                 "dataset_summary": dataset_summary,
                 "preview_dir": str(preview_dir),
+                "output_dir": str(output_dir),
+                "runtime_info": runtime_info,
             },
             f,
             indent=2,

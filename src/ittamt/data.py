@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import json
 import random
+import urllib.request
+import zipfile
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -16,6 +19,9 @@ from .tokenizer import CharTokenizer
 
 Sample = tuple[Image.Image, str]
 
+_XFUND_BASE_URL = "https://github.com/doc-analysis/XFUN/releases/download/v1.0/"
+_XFUND_LANGS = ("zh", "de", "es", "fr", "en", "it", "ja", "pt")
+
 
 @dataclass
 class DataConfig:
@@ -23,25 +29,38 @@ class DataConfig:
     image_width: int = 512
     max_label_len: int = 128
     batch_size: int = 16
-    num_workers: int = 2
+    num_workers: int = 8
+    prefetch_factor: int = 4
+    pin_memory: bool = True
+    dataset_cache_dir: str | None = None
     synthetic_samples: int = 60000
     synthetic_val_samples: int = 3000
     use_synthetic: bool = True
     use_iam: bool = True
     use_iiit5k: bool = True
+    use_textocr: bool = True
     use_sroie: bool = True
     use_cord: bool = True
     use_funsd: bool = True
+    use_doclaynet: bool = True
+    use_xfund: bool = True
     iam_train_cap: int = 18000
     iam_val_cap: int = 3000
     iiit5k_train_cap: int = 12000
     iiit5k_val_cap: int = 2000
+    textocr_train_cap: int = 24000
+    textocr_val_cap: int = 3500
     sroie_train_cap: int = 8000
     sroie_val_cap: int = 1500
     cord_train_cap: int = 8000
     cord_val_cap: int = 1500
     funsd_train_cap: int = 5000
     funsd_val_cap: int = 1000
+    doclaynet_train_cap: int = 18000
+    doclaynet_val_cap: int = 3000
+    xfund_train_cap: int = 14000
+    xfund_val_cap: int = 2500
+    xfund_languages: tuple[str, ...] = _XFUND_LANGS
 
 
 class OCRDataset(Dataset):
@@ -59,18 +78,61 @@ class OCRDataset(Dataset):
         arr = (arr - 0.5) / 0.5
         return torch.from_numpy(arr).unsqueeze(0)
 
+    def _prep_map01(self, image: Image.Image) -> torch.Tensor:
+        """Prepare a [1, H, W] float map in [0, 1] aligned with model inputs."""
+        image = image.convert("L").resize((self.cfg.image_width, self.cfg.image_height))
+        arr = np.asarray(image, dtype=np.float32) / 255.0
+        arr = np.clip(arr, 0.0, 1.0)
+        return torch.from_numpy(arr).unsqueeze(0)
+
     def __getitem__(self, idx: int) -> dict[str, Any]:
-        img, text = self.samples[idx]
+        sample = self.samples[idx]
+        if isinstance(sample, tuple) and len(sample) == 3:
+            img, text, struct = sample
+        else:
+            img, text = sample  # type: ignore[misc]
+            struct = None
+
+        # CTC training target (no BOS/EOS).
         label = self.tokenizer.encode(text)[: self.cfg.max_label_len]
-        return {
+        # Optional refinement target (BOS/EOS + padding).
+        seq_label = self.tokenizer.encode_sequence(text, max_length=self.cfg.max_label_len + 2)
+
+        out: dict[str, Any] = {
             "image": self._prep_image(img),
             "label": torch.tensor(label, dtype=torch.long),
+            "seq_label": torch.tensor(seq_label, dtype=torch.long),
             "text": text,
             "preview_image": img.convert("RGB"),
         }
 
+        if isinstance(struct, dict):
+            text_mask = struct.get("text_mask")
+            baseline = struct.get("baseline_heatmap")
+            centers = struct.get("char_center_heatmap")
+            if isinstance(text_mask, Image.Image) and isinstance(baseline, Image.Image) and isinstance(centers, Image.Image):
+                text_mask_t = self._prep_map01(text_mask)
+                baseline_t = self._prep_map01(baseline)
+                centers_t = self._prep_map01(centers)
+                density = text_mask_t.squeeze(0).sum(dim=0) / max(1.0, float(text_mask_t.shape[1]))  # [W]
+                out["struct"] = {
+                    "text_mask": text_mask_t,
+                    "baseline_heatmap": baseline_t,
+                    "char_center_heatmap": centers_t,
+                    "density": density.to(dtype=torch.float32),
+                }
+                out["struct_valid"] = True
+            else:
+                out["struct"] = None
+                out["struct_valid"] = False
+        else:
+            out["struct"] = None
+            out["struct_valid"] = False
 
-def _collate(batch: list[dict[str, Any]], pad_id: int):
+        return out
+
+
+def _collate(batch: list[dict[str, Any]], pad_id: int, seq_pad_id: int | None = None):
     images = torch.stack([b["image"] for b in batch])
     labels = [b["label"] for b in batch]
     lengths = torch.tensor([len(l) for l in labels], dtype=torch.long)
@@ -79,12 +141,51 @@ def _collate(batch: list[dict[str, Any]], pad_id: int):
     for i, label in enumerate(labels):
         if len(label) > 0:
             padded[i, : len(label)] = label
+
+    seq_labels = [b.get("seq_label", torch.tensor([], dtype=torch.long)) for b in batch]
+    seq_lengths = torch.tensor([len(l) for l in seq_labels], dtype=torch.long)
+    seq_max_len = max([len(l) for l in seq_labels] + [1])
+    effective_seq_pad = pad_id if seq_pad_id is None else seq_pad_id
+    seq_padded = torch.full((len(batch), seq_max_len), effective_seq_pad, dtype=torch.long)
+    for i, label in enumerate(seq_labels):
+        if len(label) > 0:
+            seq_padded[i, : len(label)] = label
+
+    # Structure supervision (available for synthetic samples). Real datasets set struct_valid=0.
+    h = int(images.shape[2])
+    w = int(images.shape[3])
+    struct_valid = torch.tensor([bool(b.get("struct_valid", False)) for b in batch], dtype=torch.bool)
+    text_mask = []
+    baseline = []
+    centers = []
+    density = []
+    for b in batch:
+        struct = b.get("struct")
+        if isinstance(struct, dict):
+            text_mask.append(struct.get("text_mask", torch.zeros((1, h, w), dtype=torch.float32)))
+            baseline.append(struct.get("baseline_heatmap", torch.zeros((1, h, w), dtype=torch.float32)))
+            centers.append(struct.get("char_center_heatmap", torch.zeros((1, h, w), dtype=torch.float32)))
+            density.append(struct.get("density", torch.zeros((w,), dtype=torch.float32)))
+        else:
+            text_mask.append(torch.zeros((1, h, w), dtype=torch.float32))
+            baseline.append(torch.zeros((1, h, w), dtype=torch.float32))
+            centers.append(torch.zeros((1, h, w), dtype=torch.float32))
+            density.append(torch.zeros((w,), dtype=torch.float32))
     return {
         "image": images,
         "labels": padded,
         "label_lengths": lengths,
+        "seq_labels": seq_padded,
+        "seq_label_lengths": seq_lengths,
         "texts": [b["text"] for b in batch],
         "preview_images": [b["preview_image"] for b in batch],
+        "struct": {
+            "text_mask": torch.stack(text_mask, dim=0),
+            "baseline_heatmap": torch.stack(baseline, dim=0),
+            "char_center_heatmap": torch.stack(centers, dim=0),
+            "density": torch.stack(density, dim=0),
+            "valid": struct_valid,
+        },
     }
 
 
@@ -113,9 +214,15 @@ def _safe_get_image(example: dict[str, Any]) -> Image.Image | None:
             return image.convert("RGB")
         except Exception:
             return None
-    for key in ["img", "pixel_values"]:
-        if key in example and isinstance(example[key], Image.Image):
-            return example[key].convert("RGB")
+    for key in ["img", "pixel_values", "original_image"]:
+        if key in example:
+            image = example[key]
+            if isinstance(image, Image.Image):
+                return image.convert("RGB")
+            try:
+                return image.convert("RGB")
+            except Exception:
+                continue
     return None
 
 
@@ -124,9 +231,12 @@ def _record_count(summary: dict[str, Any], split_name: str, dataset_name: str, c
     summary[split_name][dataset_name] = count
 
 
-def _record_warning(summary: dict[str, Any], dataset_name: str, exc: Exception) -> None:
+def _record_warning(summary: dict[str, Any], dataset_name: str, exc: Exception | str) -> None:
     summary.setdefault("warnings", [])
-    summary["warnings"].append(f"{dataset_name}: {type(exc).__name__}: {exc}")
+    if isinstance(exc, Exception):
+        summary["warnings"].append(f"{dataset_name}: {type(exc).__name__}: {exc}")
+    else:
+        summary["warnings"].append(f"{dataset_name}: {exc}")
 
 
 def _union_bbox(boxes: list[tuple[int, int, int, int]]) -> tuple[int, int, int, int]:
@@ -149,6 +259,20 @@ def _resolve_bbox(box: list[int] | tuple[int, int, int, int], image: Image.Image
     return x0, y0, x1, y1
 
 
+def _resolve_xywh_bbox(box: list[float] | tuple[float, float, float, float], image: Image.Image) -> tuple[int, int, int, int]:
+    x, y, w, h = [float(v) for v in box]
+    if w <= 0 or h <= 0:
+        return 0, 0, 0, 0
+    if max(x + w, y + h) > max(image.width, image.height) + 5:
+        sx = image.width / 1025.0
+        sy = image.height / 1025.0
+        x *= sx
+        y *= sy
+        w *= sx
+        h *= sy
+    return int(round(x)), int(round(y)), int(round(x + w)), int(round(y + h))
+
+
 def _quad_to_bbox(words: list[dict[str, Any]]) -> tuple[int, int, int, int]:
     xs: list[int] = []
     ys: list[int] = []
@@ -156,6 +280,12 @@ def _quad_to_bbox(words: list[dict[str, Any]]) -> tuple[int, int, int, int]:
         quad = word.get("quad", {})
         xs.extend(int(quad.get(key, 0)) for key in ["x1", "x2", "x3", "x4"])
         ys.extend(int(quad.get(key, 0)) for key in ["y1", "y2", "y3", "y4"])
+    return min(xs), min(ys), max(xs), max(ys)
+
+
+def _simplify_quad_bbox(box: list[int] | tuple[int, ...]) -> tuple[int, int, int, int]:
+    xs = [int(v) for v in box[0::2]]
+    ys = [int(v) for v in box[1::2]]
     return min(xs), min(ys), max(xs), max(ys)
 
 
@@ -249,6 +379,7 @@ def make_synthetic_samples(n: int, width: int, height: int) -> list[Sample]:
     for _ in range(n):
         text = _structured_synthetic_text() if random.random() < 0.65 else random.choice(plain_phrases)
         preserve_newlines = "\n" in text
+        spacing = 4
         canvas_height = height if not preserve_newlines else height * random.randint(2, 3)
         image = Image.new("L", (width, canvas_height), color=255)
         draw = ImageDraw.Draw(image)
@@ -260,30 +391,116 @@ def make_synthetic_samples(n: int, width: int, height: int) -> list[Sample]:
         x = random.randint(6, 20)
         y = random.randint(6, max(7, canvas_height // 6))
         fill = random.randint(0, 50)
+        norm_text = _normalize_text(text, preserve_newlines=preserve_newlines)
+
+        # Structure supervision derived from the exact synthetic render.
+        text_mask = Image.new("L", (width, canvas_height), color=0)
+        mask_draw = ImageDraw.Draw(text_mask)
+        baseline_map = Image.new("L", (width, canvas_height), color=0)
+        base_draw = ImageDraw.Draw(baseline_map)
+        centers_map = Image.new("L", (width, canvas_height), color=0)
+        centers_draw = ImageDraw.Draw(centers_map)
+
+        try:
+            ascent, descent = font.getmetrics()
+        except Exception:
+            ascent, descent = 10, 3
+        line_h = int(ascent + descent + spacing)
+
+        def _text_length(s: str) -> float:
+            try:
+                return float(draw.textlength(s, font=font))
+            except Exception:
+                try:
+                    return float(font.getsize(s)[0])
+                except Exception:
+                    return float(len(s) * 8)
+
         if preserve_newlines:
-            draw.multiline_text((x, y), text, font=font, fill=fill, spacing=4)
+            draw.multiline_text((x, y), norm_text, font=font, fill=fill, spacing=spacing)
+            mask_draw.multiline_text((x, y), norm_text, font=font, fill=255, spacing=spacing)
+            lines = norm_text.split("\n")
         else:
-            draw.text((x, y), text, font=font, fill=fill)
-        samples.append((image.convert("RGB"), _normalize_text(text, preserve_newlines=preserve_newlines)))
+            draw.text((x, y), norm_text, font=font, fill=fill)
+            mask_draw.text((x, y), norm_text, font=font, fill=255)
+            lines = [norm_text]
+
+        for li, line in enumerate(lines):
+            baseline_y = float(y + ascent + li * line_h)
+            line_w = _text_length(line)
+            base_draw.line((x, baseline_y, x + line_w, baseline_y), fill=255, width=1)
+
+            # Character center supervision (skip spaces to avoid ambiguous targets).
+            for ci, ch in enumerate(line):
+                if ch == " ":
+                    continue
+                prefix = line[:ci]
+                ch_w = _text_length(ch)
+                cx = float(x) + _text_length(prefix) + ch_w / 2.0
+                cy = baseline_y - float(ascent) / 2.0
+                r = 1
+                centers_draw.ellipse((cx - r, cy - r, cx + r, cy + r), fill=255)
+
+        baseline_map = baseline_map.filter(ImageFilter.GaussianBlur(radius=1.25))
+        centers_map = centers_map.filter(ImageFilter.GaussianBlur(radius=1.5))
+
+        samples.append(
+            (
+                image.convert("RGB"),
+                norm_text,
+                {
+                    "text_mask": text_mask,
+                    "baseline_heatmap": baseline_map,
+                    "char_center_heatmap": centers_map,
+                },
+            )
+        )
     return samples
 
 
-def _load_first_available_direct(
+def _cache_dir(cfg: DataConfig) -> str | None:
+    return cfg.dataset_cache_dir
+
+
+def _load_direct_samples(
     dataset_names: list[str],
-    split: str,
+    splits: list[str],
     cap: int,
     summary: dict[str, Any],
     summary_name: str,
+    cfg: DataConfig,
 ) -> list[Sample]:
-    split_map = {
-        "train": "train",
-        "validation": "validation",
-        "test": "test",
-    }
     samples: list[Sample] = []
     for dataset_name in dataset_names:
         try:
-            ds = load_dataset(dataset_name, split=split_map[split])
+            for split_name in splits:
+                ds = load_dataset(dataset_name, split=split_name, cache_dir=_cache_dir(cfg))
+                for example in ds:
+                    text = _normalize_text(_safe_get_text(example), preserve_newlines=True)
+                    image = _safe_get_image(example)
+                    if text and image is not None:
+                        samples.append((image, text))
+                    if len(samples) >= cap:
+                        break
+                if len(samples) >= cap:
+                    break
+            if samples:
+                _record_count(summary, "train" if "train" in splits[0] else "validation", summary_name, len(samples))
+                return samples
+        except Exception as exc:
+            _record_warning(summary, dataset_name, exc)
+    split_name = "train" if "train" in splits[0] else "validation"
+    _record_count(summary, split_name, summary_name, 0)
+    return samples
+
+
+def load_iam_split(split: str, cap: int, summary: dict[str, Any], cfg: DataConfig) -> list[Sample]:
+    dataset_names = ["Teklia/IAM-line", "Teklia/IAM-lines", "LarsHill/IAM-lines"]
+    resolved_split = "validation" if split == "validation" else split
+    samples: list[Sample] = []
+    for dataset_name in dataset_names:
+        try:
+            ds = load_dataset(dataset_name, split=resolved_split, cache_dir=_cache_dir(cfg))
             for example in ds:
                 text = _normalize_text(_safe_get_text(example), preserve_newlines=True)
                 image = _safe_get_image(example)
@@ -292,56 +509,111 @@ def _load_first_available_direct(
                 if len(samples) >= cap:
                     break
             if samples:
-                _record_count(summary, split, summary_name, len(samples))
+                _record_count(summary, split, "iam", len(samples))
                 return samples
         except Exception as exc:
             _record_warning(summary, dataset_name, exc)
-    _record_count(summary, split, summary_name, 0)
-    return samples
+    _record_count(summary, split, "iam", 0)
+    return []
 
 
-def load_iam_split(split: str, cap: int, summary: dict[str, Any]) -> list[Sample]:
-    dataset_names = ["Teklia/IAM-line", "Teklia/IAM-lines", "LarsHill/IAM-lines"]
-    resolved_split = "validation" if split == "validation" else split
-    return _load_first_available_direct(dataset_names, resolved_split, cap, summary, "iam")
-
-
-def load_iiit5k_split(split: str, cap: int, summary: dict[str, Any]) -> list[Sample]:
-    resolved_split = "test" if split == "validation" else split
-    return _load_first_available_direct(["MiXaiLL76/IIIT5K_OCR"], resolved_split, cap, summary, "iiit5k")
-
-
-def load_sroie_split(split: str, cap: int, summary: dict[str, Any]) -> list[Sample]:
-    dataset_name = "jsdnrs/ICDAR2019-SROIE"
-    resolved_split = "test" if split == "validation" else split
+def load_iiit5k_split(split: str, cap: int, summary: dict[str, Any], cfg: DataConfig) -> list[Sample]:
+    split_names = ["train", "train_numbers"] if split == "train" else ["test", "test_numbers"]
+    samples: list[Sample] = []
     try:
-        ds = load_dataset(dataset_name, split=resolved_split)
-        samples: list[Sample] = []
-        for example in ds:
-            image = _safe_get_image(example)
-            if image is None:
-                continue
-            tokens: list[tuple[str, tuple[int, int, int, int]]] = []
-            for word, box in zip(example.get("words", []), example.get("bboxes", [])):
-                text = _normalize_text(str(word))
-                if not text:
-                    continue
-                tokens.append((text, _resolve_bbox(box, image)))
-            samples.extend(_extract_line_crops(image, tokens, max(0, cap - len(samples))))
+        for split_name in split_names:
+            ds = load_dataset("MiXaiLL76/IIIT5K_OCR", split=split_name, cache_dir=_cache_dir(cfg))
+            for example in ds:
+                text = _normalize_text(_safe_get_text(example))
+                image = _safe_get_image(example)
+                if text and image is not None:
+                    samples.append((image, text))
+                if len(samples) >= cap:
+                    break
             if len(samples) >= cap:
                 break
-        _record_count(summary, split, "sroie", len(samples))
+        _record_count(summary, split, "iiit5k", len(samples))
         return samples
     except Exception as exc:
-        _record_warning(summary, dataset_name, exc)
-        _record_count(summary, split, "sroie", 0)
+        _record_warning(summary, "MiXaiLL76/IIIT5K_OCR", exc)
+        _record_count(summary, split, "iiit5k", 0)
         return []
 
 
-def load_cord_split(split: str, cap: int, summary: dict[str, Any]) -> list[Sample]:
+def load_textocr_split(split: str, cap: int, summary: dict[str, Any], cfg: DataConfig) -> list[Sample]:
+    split_names = ["train", "train_numbers"] if split == "train" else ["test", "test_numbers"]
+    samples: list[Sample] = []
+    try:
+        for split_name in split_names:
+            ds = load_dataset("MiXaiLL76/TextOCR_OCR", split=split_name, cache_dir=_cache_dir(cfg))
+            for example in ds:
+                text = _normalize_text(_safe_get_text(example))
+                image = _safe_get_image(example)
+                if text and image is not None:
+                    samples.append((image, text))
+                if len(samples) >= cap:
+                    break
+            if len(samples) >= cap:
+                break
+        _record_count(summary, split, "textocr", len(samples))
+        return samples
+    except Exception as exc:
+        _record_warning(summary, "MiXaiLL76/TextOCR_OCR", exc)
+        _record_count(summary, split, "textocr", 0)
+        return []
+
+
+def load_sroie_split(split: str, cap: int, summary: dict[str, Any], cfg: DataConfig) -> list[Sample]:
+    dataset_candidates = [
+        ("rth/sroie-2019-v2", "objects"),
+        ("jsdnrs/ICDAR2019-SROIE", "words"),
+    ]
+    resolved_split = "test" if split == "validation" else split
+    for dataset_name, mode in dataset_candidates:
+        try:
+            ds = load_dataset(dataset_name, split=resolved_split, cache_dir=_cache_dir(cfg))
+            samples: list[Sample] = []
+            for example in ds:
+                image = _safe_get_image(example)
+                if image is None:
+                    continue
+                tokens: list[tuple[str, tuple[int, int, int, int]]] = []
+                if mode == "objects":
+                    objects = example.get("objects", {})
+                    for word, box in zip(objects.get("text", []), objects.get("bbox", [])):
+                        text = _normalize_text(str(word))
+                        if not text:
+                            continue
+                        if len(box) != 4:
+                            continue
+                        x0, y0, a, b = [int(v) for v in box]
+                        if a > x0 and b > y0:
+                            bbox = _resolve_bbox((x0, y0, a, b), image)
+                        else:
+                            bbox = (x0, y0, x0 + a, y0 + b)
+                        tokens.append((text, bbox))
+                else:
+                    for word, box in zip(example.get("words", []), example.get("bboxes", [])):
+                        text = _normalize_text(str(word))
+                        if not text:
+                            continue
+                        tokens.append((text, _resolve_bbox(box, image)))
+                samples.extend(_extract_line_crops(image, tokens, max(0, cap - len(samples))))
+                if len(samples) >= cap:
+                    break
+            _record_count(summary, split, "sroie", len(samples))
+            if samples:
+                return samples
+        except Exception as exc:
+            _record_warning(summary, dataset_name, exc)
+    _record_count(summary, split, "sroie", 0)
+    return []
+
+
+def load_cord_split(split: str, cap: int, summary: dict[str, Any], cfg: DataConfig) -> list[Sample]:
     dataset_name = "naver-clova-ix/cord-v2"
     try:
-        ds = load_dataset(dataset_name, split=split)
+        ds = load_dataset(dataset_name, split=split, cache_dir=_cache_dir(cfg))
         samples: list[Sample] = []
         for example in ds:
             image = _safe_get_image(example)
@@ -360,7 +632,13 @@ def load_cord_split(split: str, cap: int, summary: dict[str, Any]) -> list[Sampl
                     words.extend(line.get("words", []))
                 if not words:
                     continue
-                words = sorted(words, key=lambda item: (min(item["quad"].get(key, 0) for key in ["y1", "y2", "y3", "y4"]), min(item["quad"].get(key, 0) for key in ["x1", "x2", "x3", "x4"])))
+                words = sorted(
+                    words,
+                    key=lambda item: (
+                        min(item["quad"].get(key, 0) for key in ["y1", "y2", "y3", "y4"]),
+                        min(item["quad"].get(key, 0) for key in ["x1", "x2", "x3", "x4"]),
+                    ),
+                )
                 text = _normalize_text(" ".join(word.get("text", "") for word in words))
                 if len(text) < 2:
                     continue
@@ -380,11 +658,11 @@ def load_cord_split(split: str, cap: int, summary: dict[str, Any]) -> list[Sampl
         return []
 
 
-def load_funsd_split(split: str, cap: int, summary: dict[str, Any]) -> list[Sample]:
+def load_funsd_split(split: str, cap: int, summary: dict[str, Any], cfg: DataConfig) -> list[Sample]:
     dataset_name = "nielsr/funsd"
     resolved_split = "test" if split == "validation" else split
     try:
-        ds = load_dataset(dataset_name, split=resolved_split)
+        ds = load_dataset(dataset_name, split=resolved_split, cache_dir=_cache_dir(cfg))
         samples: list[Sample] = []
         for example in ds:
             image = _safe_get_image(example)
@@ -407,6 +685,133 @@ def load_funsd_split(split: str, cap: int, summary: dict[str, Any]) -> list[Samp
         return []
 
 
+def load_doclaynet_split(split: str, cap: int, summary: dict[str, Any], cfg: DataConfig) -> list[Sample]:
+    dataset_name = "docling-project/DocLayNet-v1.2"
+    resolved_split = "validation" if split == "validation" else split
+    try:
+        ds = load_dataset(dataset_name, split=resolved_split, cache_dir=_cache_dir(cfg))
+        samples: list[Sample] = []
+        for example in ds:
+            image = _safe_get_image(example)
+            if image is None:
+                continue
+            for region_bbox, region_cells in zip(example.get("bboxes", []), example.get("pdf_cells", [])):
+                if len(samples) >= cap:
+                    break
+                if not isinstance(region_cells, list) or not region_cells:
+                    continue
+                tokens: list[tuple[str, tuple[int, int, int, int]]] = []
+                for cell in region_cells:
+                    text = _normalize_text(str(cell.get("text", "")), preserve_newlines=False)
+                    bbox = cell.get("bbox")
+                    if not text or not isinstance(bbox, list) or len(bbox) != 4:
+                        continue
+                    tokens.append((text, _resolve_xywh_bbox(bbox, image)))
+                if not tokens:
+                    continue
+                region = _resolve_xywh_bbox(region_bbox, image)
+                if region[2] - region[0] < 8 or region[3] - region[1] < 8:
+                    continue
+                for sample in _extract_line_crops(image, tokens, max(0, cap - len(samples))):
+                    samples.append(sample)
+                    if len(samples) >= cap:
+                        break
+            if len(samples) >= cap:
+                break
+        _record_count(summary, split, "doclaynet", len(samples))
+        return samples
+    except Exception as exc:
+        _record_warning(summary, dataset_name, exc)
+        _record_count(summary, split, "doclaynet", 0)
+        return []
+
+
+def _download_file(url: str, target_path: Path) -> Path:
+    if target_path.exists():
+        return target_path
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = target_path.with_suffix(target_path.suffix + ".tmp")
+    urllib.request.urlretrieve(url, tmp_path)
+    tmp_path.replace(target_path)
+    return target_path
+
+
+def _ensure_extracted(zip_path: Path, extract_dir: Path) -> Path:
+    marker = extract_dir / ".complete"
+    if marker.exists():
+        return extract_dir
+    extract_dir.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(zip_path) as archive:
+        archive.extractall(extract_dir)
+    marker.touch()
+    return extract_dir
+
+
+def _build_file_index(root: Path) -> dict[str, Path]:
+    index: dict[str, Path] = {}
+    for path in root.rglob("*"):
+        if path.is_file():
+            index.setdefault(path.name, path)
+    return index
+
+
+def _prepare_xfund_split(cache_dir: str | None, lang: str, split: str) -> tuple[Path, Path]:
+    if lang not in _XFUND_LANGS:
+        raise ValueError(f"Unsupported XFUN language: {lang}")
+    resolved_split = "val" if split == "validation" else "train"
+    root = Path(cache_dir or Path.home() / ".cache" / "ittamt_datasets") / "xfund" / lang / resolved_split
+    json_path = root / f"{lang}.{resolved_split}.json"
+    zip_path = root / f"{lang}.{resolved_split}.zip"
+    images_dir = root / "images"
+    _download_file(f"{_XFUND_BASE_URL}{lang}.{resolved_split}.json", json_path)
+    _download_file(f"{_XFUND_BASE_URL}{lang}.{resolved_split}.zip", zip_path)
+    _ensure_extracted(zip_path, images_dir)
+    return json_path, images_dir
+
+
+def load_xfund_split(split: str, cap: int, summary: dict[str, Any], cfg: DataConfig) -> list[Sample]:
+    samples: list[Sample] = []
+    try:
+        for lang in cfg.xfund_languages:
+            json_path, images_dir = _prepare_xfund_split(_cache_dir(cfg), lang, split)
+            with open(json_path, "r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+            image_index = _build_file_index(images_dir)
+            for document in payload.get("documents", []):
+                if len(samples) >= cap:
+                    break
+                image_name = document.get("img", {}).get("fname")
+                image_path = image_index.get(image_name)
+                if image_path is None:
+                    continue
+                image = Image.open(image_path).convert("RGB")
+                for line in document.get("document", []):
+                    if len(samples) >= cap:
+                        break
+                    text = _normalize_text(str(line.get("text", "")), preserve_newlines=False)
+                    if len(text) < 2:
+                        continue
+                    boxes = [
+                        _simplify_quad_bbox(word.get("box", []))
+                        for word in line.get("words", [])
+                        if isinstance(word, dict) and isinstance(word.get("box"), list) and len(word["box"]) >= 8
+                    ]
+                    if not boxes:
+                        continue
+                    crop = _crop_image(image, _union_bbox(boxes))
+                    if crop is None:
+                        continue
+                    samples.append((crop, text))
+            if len(samples) >= cap:
+                break
+        _record_count(summary, split, "xfund", len(samples))
+        return samples
+    except Exception as exc:
+        _record_warning(summary, "XFUND", exc)
+        _record_count(summary, split, "xfund", 0)
+        return []
+
+
 def build_dataloaders(tokenizer: CharTokenizer, cfg: DataConfig):
     summary: dict[str, Any] = {"train": {}, "validation": {}, "warnings": []}
     train_samples: list[Sample] = []
@@ -421,24 +826,36 @@ def build_dataloaders(tokenizer: CharTokenizer, cfg: DataConfig):
         _record_count(summary, "validation", "synthetic", len(synthetic_val))
 
     if cfg.use_iam:
-        train_samples.extend(load_iam_split("train", cfg.iam_train_cap, summary))
-        val_samples.extend(load_iam_split("validation", cfg.iam_val_cap, summary))
+        train_samples.extend(load_iam_split("train", cfg.iam_train_cap, summary, cfg))
+        val_samples.extend(load_iam_split("validation", cfg.iam_val_cap, summary, cfg))
 
     if cfg.use_iiit5k:
-        train_samples.extend(load_iiit5k_split("train", cfg.iiit5k_train_cap, summary))
-        val_samples.extend(load_iiit5k_split("validation", cfg.iiit5k_val_cap, summary))
+        train_samples.extend(load_iiit5k_split("train", cfg.iiit5k_train_cap, summary, cfg))
+        val_samples.extend(load_iiit5k_split("validation", cfg.iiit5k_val_cap, summary, cfg))
+
+    if cfg.use_textocr:
+        train_samples.extend(load_textocr_split("train", cfg.textocr_train_cap, summary, cfg))
+        val_samples.extend(load_textocr_split("validation", cfg.textocr_val_cap, summary, cfg))
 
     if cfg.use_sroie:
-        train_samples.extend(load_sroie_split("train", cfg.sroie_train_cap, summary))
-        val_samples.extend(load_sroie_split("validation", cfg.sroie_val_cap, summary))
+        train_samples.extend(load_sroie_split("train", cfg.sroie_train_cap, summary, cfg))
+        val_samples.extend(load_sroie_split("validation", cfg.sroie_val_cap, summary, cfg))
 
     if cfg.use_cord:
-        train_samples.extend(load_cord_split("train", cfg.cord_train_cap, summary))
-        val_samples.extend(load_cord_split("validation", cfg.cord_val_cap, summary))
+        train_samples.extend(load_cord_split("train", cfg.cord_train_cap, summary, cfg))
+        val_samples.extend(load_cord_split("validation", cfg.cord_val_cap, summary, cfg))
 
     if cfg.use_funsd:
-        train_samples.extend(load_funsd_split("train", cfg.funsd_train_cap, summary))
-        val_samples.extend(load_funsd_split("validation", cfg.funsd_val_cap, summary))
+        train_samples.extend(load_funsd_split("train", cfg.funsd_train_cap, summary, cfg))
+        val_samples.extend(load_funsd_split("validation", cfg.funsd_val_cap, summary, cfg))
+
+    if cfg.use_doclaynet:
+        train_samples.extend(load_doclaynet_split("train", cfg.doclaynet_train_cap, summary, cfg))
+        val_samples.extend(load_doclaynet_split("validation", cfg.doclaynet_val_cap, summary, cfg))
+
+    if cfg.use_xfund:
+        train_samples.extend(load_xfund_split("train", cfg.xfund_train_cap, summary, cfg))
+        val_samples.extend(load_xfund_split("validation", cfg.xfund_val_cap, summary, cfg))
 
     random.shuffle(train_samples)
     random.shuffle(val_samples)
@@ -446,21 +863,26 @@ def build_dataloaders(tokenizer: CharTokenizer, cfg: DataConfig):
     train_ds = OCRDataset(train_samples, tokenizer, cfg)
     val_ds = OCRDataset(val_samples, tokenizer, cfg)
 
-    collate_fn = lambda batch: _collate(batch, pad_id=tokenizer.blank_id)
+    collate_fn = lambda batch: _collate(batch, pad_id=tokenizer.blank_id, seq_pad_id=tokenizer.pad_id)
+    loader_kwargs: dict[str, Any] = {
+        "num_workers": cfg.num_workers,
+        "pin_memory": cfg.pin_memory,
+        "collate_fn": collate_fn,
+    }
+    if cfg.num_workers > 0:
+        loader_kwargs["persistent_workers"] = True
+        loader_kwargs["prefetch_factor"] = max(2, cfg.prefetch_factor)
+
     train_loader = DataLoader(
         train_ds,
         batch_size=cfg.batch_size,
         shuffle=True,
-        num_workers=cfg.num_workers,
-        pin_memory=True,
-        collate_fn=collate_fn,
+        **loader_kwargs,
     )
     val_loader = DataLoader(
         val_ds,
         batch_size=cfg.batch_size,
         shuffle=False,
-        num_workers=cfg.num_workers,
-        pin_memory=True,
-        collate_fn=collate_fn,
+        **loader_kwargs,
     )
     return train_loader, val_loader, summary
