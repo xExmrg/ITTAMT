@@ -5,15 +5,20 @@ import argparse
 import sys
 from pathlib import Path
 
+
+def _bootstrap_src_path() -> None:
+    """Allow script execution without editable install (e.g., raw Colab clone)."""
+    project_root = Path(__file__).resolve().parents[1]
+    src_dir = project_root / "src"
+    if str(src_dir) not in sys.path:
+        sys.path.insert(0, str(src_dir))
+
+
+_bootstrap_src_path()
+
 import numpy as np
 import torch
 from PIL import Image, ImageGrab
-
-# Allow running as `python scripts/infer.py` without installing package.
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-SRC_DIR = PROJECT_ROOT / "src"
-if str(SRC_DIR) not in sys.path:
-    sys.path.insert(0, str(SRC_DIR))
 
 from ittamt.model import StrideMoEConfig, StrideMoEOCR
 from ittamt.tokenizer import CharTokenizer
@@ -31,11 +36,11 @@ def screenshot_to_file(path: str):
     shot.save(path)
 
 
-def greedy_decode(ids, tokenizer: CharTokenizer):
+def greedy_decode(ids: list[int], tokenizer: CharTokenizer) -> str:
     return tokenizer.decode_ctc(ids)
 
 
-def get_device():
+def get_device() -> torch.device:
     if torch.cuda.is_available():
         return torch.device("cuda")
     if torch.backends.mps.is_available():

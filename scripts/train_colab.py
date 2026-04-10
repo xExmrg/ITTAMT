@@ -7,15 +7,20 @@ import os
 import sys
 from pathlib import Path
 
+
+def _bootstrap_src_path() -> None:
+    """Allow script execution without editable install (e.g., raw Colab clone)."""
+    project_root = Path(__file__).resolve().parents[1]
+    src_dir = project_root / "src"
+    if str(src_dir) not in sys.path:
+        sys.path.insert(0, str(src_dir))
+
+
+_bootstrap_src_path()
+
 import torch
 import torch.nn.functional as F
 from tqdm import tqdm
-
-# Allow running as `python scripts/train_colab.py` without installing package.
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-SRC_DIR = PROJECT_ROOT / "src"
-if str(SRC_DIR) not in sys.path:
-    sys.path.insert(0, str(SRC_DIR))
 
 from ittamt.data import DataConfig, build_dataloaders
 from ittamt.model import StrideMoEConfig, StrideMoEOCR
@@ -69,7 +74,7 @@ def cer(pred: str, ref: str) -> float:
     return edit_distance(pred, ref) / max(1, len(ref))
 
 
-def get_device():
+def get_device() -> torch.device:
     if torch.cuda.is_available():
         return torch.device("cuda")
     if torch.backends.mps.is_available():
@@ -172,7 +177,6 @@ def main():
             best_val = val_loss
             torch.save(ckpt, Path(args.output_dir) / "best.pt")
 
-    # Export TorchScript for macOS-friendly inference
     model.eval()
     dummy = torch.randn(1, 1, args.image_height, args.image_width, device=device)
     traced = torch.jit.trace(model, dummy)
