@@ -5,16 +5,28 @@ import argparse
 import json
 import os
 import textwrap
+import sys
 from pathlib import Path
+
+
+def _bootstrap_src_path() -> None:
+    """Allow script execution without editable install (e.g., raw Colab clone)."""
+    project_root = Path(__file__).resolve().parents[1]
+    src_dir = project_root / "src"
+    if str(src_dir) not in sys.path:
+        sys.path.insert(0, str(src_dir))
+
+
+_bootstrap_src_path()
 
 import torch
 import torch.nn.functional as F
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 from tqdm import tqdm
 
-from src.ittamt.data import DataConfig, build_dataloaders
-from src.ittamt.model import StrideMoEConfig, StrideMoEOCR
-from src.ittamt.tokenizer import CharTokenizer
+from ittamt.data import DataConfig, build_dataloaders
+from ittamt.model import StrideMoEConfig, StrideMoEOCR
+from ittamt.tokenizer import CharTokenizer
 
 
 def ctc_loss_from_logits(logits, labels, label_lengths, blank_id: int):
