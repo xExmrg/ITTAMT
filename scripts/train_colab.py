@@ -17,7 +17,6 @@ def _bootstrap_src_path() -> None:
 
 
 _bootstrap_src_path()
-
 import torch
 import torch.nn.functional as F
 from tqdm import tqdm
@@ -128,7 +127,7 @@ def main():
             label_lengths = batch["label_lengths"].to(device, non_blocking=True)
 
             optimizer.zero_grad(set_to_none=True)
-            with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
+            with torch.autocast(device_type=device.type if device.type != "mps" else "cpu", dtype=torch.bfloat16, enabled=device.type == "cuda"):
                 logits, aux_loss = model(images)
                 ctc = ctc_loss_from_logits(logits, labels, label_lengths, tokenizer.blank_id)
                 loss = ctc + 0.05 * aux_loss
@@ -177,6 +176,7 @@ def main():
             best_val = val_loss
             torch.save(ckpt, Path(args.output_dir) / "best.pt")
 
+    # Export TorchScript for macOS-friendly inference
     model.eval()
     dummy = torch.randn(1, 1, args.image_height, args.image_width, device=device)
     traced = torch.jit.trace(model, dummy)
