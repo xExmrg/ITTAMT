@@ -4,7 +4,7 @@ import json
 from dataclasses import dataclass
 
 
-DEFAULT_CHARS = list("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 .,;:!?@#$%^&*()-_=+[]{}<>/\\|'\"`~")
+DEFAULT_CHARS = list("\nabcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 .,;:!?@#$%^&*()-_=+[]{}<>/\\|'\"`~")
 SPECIAL_TOKENS = ["<blank>", "<pad>"]
 
 

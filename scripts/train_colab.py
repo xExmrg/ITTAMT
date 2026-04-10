@@ -4,10 +4,12 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import textwrap
 from pathlib import Path
 
 import torch
 import torch.nn.functional as F
+from PIL import Image, ImageDraw, ImageFont, ImageOps
 from tqdm import tqdm
 
 from src.ittamt.data import DataConfig, build_dataloaders
@@ -23,8 +25,8 @@ def ctc_loss_from_logits(logits, labels, label_lengths, blank_id: int):
 
     flat_targets = []
     for i in range(bsz):
-        ll = int(label_lengths[i].item())
-        flat_targets.append(labels[i, :ll])
+        length = int(label_lengths[i].item())
+        flat_targets.append(labels[i, :length])
     targets = torch.cat(flat_targets) if flat_targets else torch.tensor([], device=logits.device, dtype=torch.long)
 
     return F.ctc_loss(
@@ -62,12 +64,78 @@ def cer(pred: str, ref: str) -> float:
     return edit_distance(pred, ref) / max(1, len(ref))
 
 
-def get_device():
+def get_device() -> torch.device:
     if torch.cuda.is_available():
         return torch.device("cuda")
     if torch.backends.mps.is_available():
         return torch.device("mps")
     return torch.device("cpu")
+
+
+def _format_preview_text(label: str, value: str, width: int = 60) -> list[str]:
+    normalized = value.replace("\n", " | ")
+    wrapped = textwrap.wrap(f"{label}: {normalized}", width=width) or [f"{label}: "]
+    return wrapped[:4]
+
+
+def save_eval_preview(
+    preview_images: list[Image.Image],
+    refs: list[str],
+    preds: list[str],
+    out_path: Path,
+    image_width: int,
+    max_items: int,
+) -> None:
+    if not preview_images:
+        return
+
+    preview_dir = out_path.parent
+    preview_dir.mkdir(parents=True, exist_ok=True)
+
+    font = ImageFont.load_default()
+    card_width = max(560, image_width + 48)
+    image_box_height = 128
+    text_box_height = 84
+    cards: list[Image.Image] = []
+
+    for idx, (image, ref, pred) in enumerate(zip(preview_images[:max_items], refs[:max_items], preds[:max_items]), start=1):
+        canvas = Image.new("RGB", (card_width, image_box_height + text_box_height), "white")
+        draw = ImageDraw.Draw(canvas)
+
+        bordered = ImageOps.expand(image.convert("RGB"), border=2, fill="black")
+        fitted = ImageOps.contain(bordered, (card_width - 20, image_box_height - 12))
+        canvas.paste(fitted, ((card_width - fitted.width) // 2, 6))
+
+        text_y = image_box_height + 2
+        draw.text((8, text_y), f"sample {idx}", fill="black", font=font)
+        text_y += 14
+        for line in _format_preview_text("ref", ref):
+            draw.text((8, text_y), line, fill="black", font=font)
+            text_y += 12
+        for line in _format_preview_text("pred", pred):
+            draw.text((8, text_y), line, fill="black", font=font)
+            text_y += 12
+        cards.append(canvas)
+
+    preview = Image.new("RGB", (card_width, len(cards) * cards[0].height), "white")
+    for row, card in enumerate(cards):
+        preview.paste(card, (0, row * card.height))
+    preview.save(out_path)
+
+
+def _print_dataset_summary(summary: dict[str, dict[str, int] | list[str]]) -> None:
+    print("dataset mix:")
+    for split_name in ["train", "validation"]:
+        split_summary = summary.get(split_name, {})
+        total = sum(split_summary.values()) if isinstance(split_summary, dict) else 0
+        print(f"  {split_name}: total={total}")
+        if isinstance(split_summary, dict):
+            for dataset_name, count in split_summary.items():
+                print(f"    - {dataset_name}: {count}")
+    warnings = summary.get("warnings", [])
+    if isinstance(warnings, list):
+        for warning in warnings:
+            print(f"  warning: {warning}")
 
 
 def main():
@@ -78,7 +146,9 @@ def main():
     ap.add_argument("--image-height", type=int, default=64)
     ap.add_argument("--image-width", type=int, default=512)
     ap.add_argument("--synthetic-samples", type=int, default=40000)
+    ap.add_argument("--synthetic-val-samples", type=int, default=3000)
     ap.add_argument("--num-workers", type=int, default=2)
+    ap.add_argument("--preview-count", type=int, default=4)
     ap.add_argument("--output-dir", type=str, default="artifacts/stride_moe")
     args = ap.parse_args()
 
@@ -92,9 +162,10 @@ def main():
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         synthetic_samples=args.synthetic_samples,
-        use_iam=True,
+        synthetic_val_samples=args.synthetic_val_samples,
     )
-    train_loader, val_loader = build_dataloaders(tokenizer, data_cfg)
+    train_loader, val_loader, dataset_summary = build_dataloaders(tokenizer, data_cfg)
+    _print_dataset_summary(dataset_summary)
 
     model_cfg = StrideMoEConfig(vocab_size=len(tokenizer.itos), dim=256, depth=6, heads=8, num_experts=8, top_k=2)
     model = StrideMoEOCR(model_cfg)
@@ -104,6 +175,7 @@ def main():
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
     scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
+    preview_dir = Path(args.output_dir) / "eval_previews"
 
     best_val = float("inf")
     for epoch in range(1, args.epochs + 1):
@@ -133,6 +205,7 @@ def main():
         model.eval()
         val_loss = 0.0
         cers = []
+        preview_payload: tuple[list[Image.Image], list[str], list[str]] | None = None
         with torch.no_grad():
             for batch in tqdm(val_loader, desc=f"epoch {epoch} val"):
                 images = batch["image"].to(device, non_blocking=True)
@@ -145,12 +218,28 @@ def main():
                 val_loss += float(loss.item())
 
                 preds = greedy_decode(logits, tokenizer)
-                for p, r in zip(preds, batch["texts"]):
-                    cers.append(cer(p, r))
+                for pred, ref in zip(preds, batch["texts"]):
+                    cers.append(cer(pred, ref))
+
+                if preview_payload is None:
+                    preview_payload = (
+                        batch["preview_images"][: args.preview_count],
+                        batch["texts"][: args.preview_count],
+                        preds[: args.preview_count],
+                    )
 
         val_loss /= max(1, len(val_loader))
         mean_cer = sum(cers) / max(1, len(cers))
         print(f"epoch={epoch} train_loss={train_loss:.4f} val_loss={val_loss:.4f} val_CER={mean_cer:.4f}")
+
+        if preview_payload is not None:
+            preview_path = preview_dir / f"epoch_{epoch:03d}.png"
+            preview_images, refs, preds = preview_payload
+            save_eval_preview(preview_images, refs, preds, preview_path, args.image_width, args.preview_count)
+            print(f"saved validation preview to {preview_path}")
+            for idx, (ref, pred) in enumerate(zip(refs, preds), start=1):
+                print(f"sample[{idx}] ref={ref!r}")
+                print(f"sample[{idx}] pred={pred!r}")
 
         ckpt = {
             "model": model.state_dict(),
@@ -158,6 +247,7 @@ def main():
             "epoch": epoch,
             "val_loss": val_loss,
             "val_cer": mean_cer,
+            "dataset_summary": dataset_summary,
         }
         torch.save(ckpt, Path(args.output_dir) / "last.pt")
 
@@ -172,7 +262,17 @@ def main():
     traced.save(str(Path(args.output_dir) / "model_ts.pt"))
 
     with open(Path(args.output_dir) / "train_meta.json", "w", encoding="utf-8") as f:
-        json.dump({"device": str(device), "epochs": args.epochs, "best_val": best_val}, f, indent=2)
+        json.dump(
+            {
+                "device": str(device),
+                "epochs": args.epochs,
+                "best_val": best_val,
+                "dataset_summary": dataset_summary,
+                "preview_dir": str(preview_dir),
+            },
+            f,
+            indent=2,
+        )
 
 
 if __name__ == "__main__":

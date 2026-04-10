@@ -58,12 +58,12 @@ class SparseMoEFFN(nn.Module):
         out = torch.zeros_like(x)
         for k in range(self.top_k):
             idx = topk_idx[..., k]  # [B, T]
-            gate = gates[..., k].unsqueeze(-1)
+            gate = gates[..., k].unsqueeze(-1).to(dtype=out.dtype)
             expert_out = torch.zeros_like(x)
             for e in range(self.num_experts):
                 mask = idx == e
                 if mask.any():
-                    vals = self.experts[e](x[mask])
+                    vals = self.experts[e](x[mask]).to(dtype=expert_out.dtype)
                     expert_out[mask] = vals
             out = out + gate * expert_out
 
