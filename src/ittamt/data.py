@@ -20,7 +20,7 @@ from .tokenizer import CharTokenizer
 Sample = tuple[Image.Image, str]
 
 _XFUND_BASE_URL = "https://github.com/doc-analysis/XFUN/releases/download/v1.0/"
-_XFUND_LANGS = ("zh", "de", "es", "fr", "en", "it", "ja", "pt")
+_XFUND_LANGS = ("zh", "de", "es", "fr", "it", "ja", "pt")
 
 
 @dataclass
@@ -771,8 +771,8 @@ def _prepare_xfund_split(cache_dir: str | None, lang: str, split: str) -> tuple[
 
 def load_xfund_split(split: str, cap: int, summary: dict[str, Any], cfg: DataConfig) -> list[Sample]:
     samples: list[Sample] = []
-    try:
-        for lang in cfg.xfund_languages:
+    for lang in cfg.xfund_languages:
+        try:
             json_path, images_dir = _prepare_xfund_split(_cache_dir(cfg), lang, split)
             with open(json_path, "r", encoding="utf-8") as handle:
                 payload = json.load(handle)
@@ -802,14 +802,15 @@ def load_xfund_split(split: str, cap: int, summary: dict[str, Any], cfg: DataCon
                     if crop is None:
                         continue
                     samples.append((crop, text))
+                    if len(samples) >= cap:
+                        break
             if len(samples) >= cap:
                 break
-        _record_count(summary, split, "xfund", len(samples))
-        return samples
-    except Exception as exc:
-        _record_warning(summary, "XFUND", exc)
-        _record_count(summary, split, "xfund", 0)
-        return []
+        except Exception as exc:
+            _record_warning(summary, f"XFUND[{lang}]", exc)
+            continue
+    _record_count(summary, split, "xfund", len(samples))
+    return samples
 
 
 def build_dataloaders(tokenizer: CharTokenizer, cfg: DataConfig):
