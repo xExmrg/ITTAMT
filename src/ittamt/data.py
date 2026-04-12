@@ -489,6 +489,25 @@ def _cache_dir(cfg: DataConfig) -> str | None:
     return cfg.dataset_cache_dir
 
 
+def _load_dataset_logged(dataset_name: str, split: str, cfg: DataConfig):
+    _data_log(f"load_dataset start dataset={dataset_name} split={split}")
+    started_at = time.perf_counter()
+    ds = load_dataset(dataset_name, split=split, cache_dir=_cache_dir(cfg))
+    elapsed = time.perf_counter() - started_at
+    try:
+        row_count = len(ds)
+    except Exception:
+        row_count = "unknown"
+    _data_log(f"load_dataset done dataset={dataset_name} split={split} rows={row_count} in {elapsed:.1f}s")
+    return ds
+
+
+def _maybe_log_scan_progress(stage: str, seen: int, kept: int, started_at: float, every: int = 1000) -> None:
+    if seen == 1 or seen % every == 0:
+        elapsed = time.perf_counter() - started_at
+        _data_log(f"{stage}: scanned={seen} kept={kept} elapsed={elapsed:.1f}s")
+
+
 def _load_direct_samples(
     dataset_names: list[str],
     splits: list[str],
@@ -501,12 +520,14 @@ def _load_direct_samples(
     for dataset_name in dataset_names:
         try:
             for split_name in splits:
-                ds = load_dataset(dataset_name, split=split_name, cache_dir=_cache_dir(cfg))
-                for example in ds:
+                ds = _load_dataset_logged(dataset_name, split_name, cfg)
+                iter_started_at = time.perf_counter()
+                for seen, example in enumerate(ds, start=1):
                     text = _normalize_text(_safe_get_text(example), preserve_newlines=True)
                     image = _safe_get_image(example)
                     if text and image is not None:
                         samples.append((image, text))
+                    _maybe_log_scan_progress(f"{summary_name}/{split_name}", seen, len(samples), iter_started_at)
                     if len(samples) >= cap:
                         break
                 if len(samples) >= cap:
@@ -527,12 +548,14 @@ def load_iam_split(split: str, cap: int, summary: dict[str, Any], cfg: DataConfi
     samples: list[Sample] = []
     for dataset_name in dataset_names:
         try:
-            ds = load_dataset(dataset_name, split=resolved_split, cache_dir=_cache_dir(cfg))
-            for example in ds:
+            ds = _load_dataset_logged(dataset_name, resolved_split, cfg)
+            iter_started_at = time.perf_counter()
+            for seen, example in enumerate(ds, start=1):
                 text = _normalize_text(_safe_get_text(example), preserve_newlines=True)
                 image = _safe_get_image(example)
                 if text and image is not None:
                     samples.append((image, text))
+                _maybe_log_scan_progress(f"iam/{resolved_split}", seen, len(samples), iter_started_at)
                 if len(samples) >= cap:
                     break
             if samples:
@@ -549,12 +572,14 @@ def load_iiit5k_split(split: str, cap: int, summary: dict[str, Any], cfg: DataCo
     samples: list[Sample] = []
     try:
         for split_name in split_names:
-            ds = load_dataset("MiXaiLL76/IIIT5K_OCR", split=split_name, cache_dir=_cache_dir(cfg))
-            for example in ds:
+            ds = _load_dataset_logged("MiXaiLL76/IIIT5K_OCR", split_name, cfg)
+            iter_started_at = time.perf_counter()
+            for seen, example in enumerate(ds, start=1):
                 text = _normalize_text(_safe_get_text(example))
                 image = _safe_get_image(example)
                 if text and image is not None:
                     samples.append((image, text))
+                _maybe_log_scan_progress(f"iiit5k/{split_name}", seen, len(samples), iter_started_at)
                 if len(samples) >= cap:
                     break
             if len(samples) >= cap:
@@ -572,12 +597,14 @@ def load_textocr_split(split: str, cap: int, summary: dict[str, Any], cfg: DataC
     samples: list[Sample] = []
     try:
         for split_name in split_names:
-            ds = load_dataset("MiXaiLL76/TextOCR_OCR", split=split_name, cache_dir=_cache_dir(cfg))
-            for example in ds:
+            ds = _load_dataset_logged("MiXaiLL76/TextOCR_OCR", split_name, cfg)
+            iter_started_at = time.perf_counter()
+            for seen, example in enumerate(ds, start=1):
                 text = _normalize_text(_safe_get_text(example))
                 image = _safe_get_image(example)
                 if text and image is not None:
                     samples.append((image, text))
+                _maybe_log_scan_progress(f"textocr/{split_name}", seen, len(samples), iter_started_at)
                 if len(samples) >= cap:
                     break
             if len(samples) >= cap:
@@ -598,11 +625,13 @@ def load_sroie_split(split: str, cap: int, summary: dict[str, Any], cfg: DataCon
     resolved_split = "test" if split == "validation" else split
     for dataset_name, mode in dataset_candidates:
         try:
-            ds = load_dataset(dataset_name, split=resolved_split, cache_dir=_cache_dir(cfg))
+            ds = _load_dataset_logged(dataset_name, resolved_split, cfg)
             samples: list[Sample] = []
-            for example in ds:
+            iter_started_at = time.perf_counter()
+            for seen, example in enumerate(ds, start=1):
                 image = _safe_get_image(example)
                 if image is None:
+                    _maybe_log_scan_progress(f"sroie/{dataset_name}/{resolved_split}", seen, len(samples), iter_started_at)
                     continue
                 tokens: list[tuple[str, tuple[int, int, int, int]]] = []
                 if mode == "objects":
@@ -626,6 +655,7 @@ def load_sroie_split(split: str, cap: int, summary: dict[str, Any], cfg: DataCon
                             continue
                         tokens.append((text, _resolve_bbox(box, image)))
                 samples.extend(_extract_line_crops(image, tokens, max(0, cap - len(samples))))
+                _maybe_log_scan_progress(f"sroie/{dataset_name}/{resolved_split}", seen, len(samples), iter_started_at)
                 if len(samples) >= cap:
                     break
             _record_count(summary, split, "sroie", len(samples))
@@ -640,12 +670,14 @@ def load_sroie_split(split: str, cap: int, summary: dict[str, Any], cfg: DataCon
 def load_cord_split(split: str, cap: int, summary: dict[str, Any], cfg: DataConfig) -> list[Sample]:
     dataset_name = "naver-clova-ix/cord-v2"
     try:
-        ds = load_dataset(dataset_name, split=split, cache_dir=_cache_dir(cfg))
+        ds = _load_dataset_logged(dataset_name, split, cfg)
         samples: list[Sample] = []
-        for example in ds:
+        iter_started_at = time.perf_counter()
+        for seen, example in enumerate(ds, start=1):
             image = _safe_get_image(example)
             gt_raw = example.get("ground_truth")
             if image is None or not isinstance(gt_raw, str):
+                _maybe_log_scan_progress(f"cord/{split}", seen, len(samples), iter_started_at)
                 continue
             gt = json.loads(gt_raw)
             groups: dict[tuple[int, int], list[dict[str, Any]]] = {}
@@ -675,6 +707,7 @@ def load_cord_split(split: str, cap: int, summary: dict[str, Any], cfg: DataConf
                 samples.append((crop, text))
                 if len(samples) >= cap:
                     break
+            _maybe_log_scan_progress(f"cord/{split}", seen, len(samples), iter_started_at)
             if len(samples) >= cap:
                 break
         _record_count(summary, split, "cord", len(samples))
@@ -689,11 +722,13 @@ def load_funsd_split(split: str, cap: int, summary: dict[str, Any], cfg: DataCon
     dataset_name = "nielsr/funsd"
     resolved_split = "test" if split == "validation" else split
     try:
-        ds = load_dataset(dataset_name, split=resolved_split, cache_dir=_cache_dir(cfg))
+        ds = _load_dataset_logged(dataset_name, resolved_split, cfg)
         samples: list[Sample] = []
-        for example in ds:
+        iter_started_at = time.perf_counter()
+        for seen, example in enumerate(ds, start=1):
             image = _safe_get_image(example)
             if image is None:
+                _maybe_log_scan_progress(f"funsd/{resolved_split}", seen, len(samples), iter_started_at)
                 continue
             tokens: list[tuple[str, tuple[int, int, int, int]]] = []
             for word, box in zip(example.get("words", []), example.get("bboxes", [])):
@@ -702,6 +737,7 @@ def load_funsd_split(split: str, cap: int, summary: dict[str, Any], cfg: DataCon
                     continue
                 tokens.append((text, _resolve_bbox(box, image)))
             samples.extend(_extract_line_crops(image, tokens, max(0, cap - len(samples))))
+            _maybe_log_scan_progress(f"funsd/{resolved_split}", seen, len(samples), iter_started_at)
             if len(samples) >= cap:
                 break
         _record_count(summary, split, "funsd", len(samples))
@@ -716,11 +752,13 @@ def load_doclaynet_split(split: str, cap: int, summary: dict[str, Any], cfg: Dat
     dataset_name = "docling-project/DocLayNet-v1.2"
     resolved_split = "validation" if split == "validation" else split
     try:
-        ds = load_dataset(dataset_name, split=resolved_split, cache_dir=_cache_dir(cfg))
+        ds = _load_dataset_logged(dataset_name, resolved_split, cfg)
         samples: list[Sample] = []
-        for example in ds:
+        iter_started_at = time.perf_counter()
+        for seen, example in enumerate(ds, start=1):
             image = _safe_get_image(example)
             if image is None:
+                _maybe_log_scan_progress(f"doclaynet/{resolved_split}", seen, len(samples), iter_started_at)
                 continue
             for region_bbox, region_cells in zip(example.get("bboxes", []), example.get("pdf_cells", [])):
                 if len(samples) >= cap:
@@ -743,6 +781,7 @@ def load_doclaynet_split(split: str, cap: int, summary: dict[str, Any], cfg: Dat
                     samples.append(sample)
                     if len(samples) >= cap:
                         break
+            _maybe_log_scan_progress(f"doclaynet/{resolved_split}", seen, len(samples), iter_started_at)
             if len(samples) >= cap:
                 break
         _record_count(summary, split, "doclaynet", len(samples))
