@@ -196,6 +196,13 @@ python scripts/train_colab.py \
   --prefetch-factor "${PREFETCH_FACTOR:-4}" \
   --synthetic-samples "${SYNTHETIC_SAMPLES:-40000}" \
   --use-iam "${USE_IAM:-0}" \
+  --use-iiit5k "${USE_IIIT5K:-1}" \
+  --use-textocr "${USE_TEXTOCR:-0}" \
+  --use-sroie "${USE_SROIE:-0}" \
+  --use-cord "${USE_CORD:-0}" \
+  --use-funsd "${USE_FUNSD:-0}" \
+  --use-doclaynet "${USE_DOCLAYNET:-0}" \
+  --use-xfund "${USE_XFUND:-0}" \
   --dataset-cache-dir "$HF_DATASETS_CACHE" \
   --output-dir "$OUTPUT_DIR" \
   --mirror-output-dir "$PERSIST_OUTPUT_DIR"

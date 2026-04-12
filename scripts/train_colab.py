@@ -259,6 +259,13 @@ def main():
     ap.add_argument("--prefetch-factor", type=int, default=4)
     ap.add_argument("--preview-count", type=int, default=4)
     ap.add_argument("--use-iam", type=int, choices=[0, 1], default=0, help="Enable IAM line dataset loading")
+    ap.add_argument("--use-iiit5k", type=int, choices=[0, 1], default=1, help="Enable IIIT5K cropped OCR loading")
+    ap.add_argument("--use-textocr", type=int, choices=[0, 1], default=0, help="Enable TextOCR loading")
+    ap.add_argument("--use-sroie", type=int, choices=[0, 1], default=0, help="Enable SROIE receipt OCR loading")
+    ap.add_argument("--use-cord", type=int, choices=[0, 1], default=0, help="Enable CORD receipt OCR loading")
+    ap.add_argument("--use-funsd", type=int, choices=[0, 1], default=0, help="Enable FUNSD form OCR loading")
+    ap.add_argument("--use-doclaynet", type=int, choices=[0, 1], default=0, help="Enable DocLayNet OCR extraction loading")
+    ap.add_argument("--use-xfund", type=int, choices=[0, 1], default=0, help="Enable XFUND OCR extraction loading")
     ap.add_argument("--dataset-cache-dir", type=str, default=None)
     ap.add_argument("--allow-non-cuda", action="store_true", help="Allow fallback to CPU/MPS instead of requiring CUDA")
     ap.add_argument("--output-dir", type=str, default=None)
@@ -298,6 +305,16 @@ def main():
     print(f"  mirror_output_dir: {mirror_output_dir if mirror_output_dir is not None else 'disabled'}")
     if running_in_colab():
         print(f"  persist_root: {default_persist_root()}")
+    print("  dataset_profile:")
+    print(f"    - synthetic: 1")
+    print(f"    - iam: {args.use_iam}")
+    print(f"    - iiit5k: {args.use_iiit5k}")
+    print(f"    - textocr: {args.use_textocr}")
+    print(f"    - sroie: {args.use_sroie}")
+    print(f"    - cord: {args.use_cord}")
+    print(f"    - funsd: {args.use_funsd}")
+    print(f"    - doclaynet: {args.use_doclaynet}")
+    print(f"    - xfund: {args.use_xfund}")
 
     tokenizer = CharTokenizer.build_default()
     tokenizer.save(str(output_dir / "tokenizer.json"))
@@ -314,6 +331,13 @@ def main():
         synthetic_samples=args.synthetic_samples,
         synthetic_val_samples=args.synthetic_val_samples,
         use_iam=bool(args.use_iam),
+        use_iiit5k=bool(args.use_iiit5k),
+        use_textocr=bool(args.use_textocr),
+        use_sroie=bool(args.use_sroie),
+        use_cord=bool(args.use_cord),
+        use_funsd=bool(args.use_funsd),
+        use_doclaynet=bool(args.use_doclaynet),
+        use_xfund=bool(args.use_xfund),
     )
     _stage_log("building dataloaders")
     dataloader_started_at = time.perf_counter()

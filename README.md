@@ -30,7 +30,7 @@ The active training run now uses a fast local runtime workspace under `/content/
 
 ## Training data mix
 
-The training loader now mixes several OCR sources automatically:
+The training loader can mix several OCR sources automatically:
 
 - `Teklia/IAM-line`: handwritten English line recognition.
 - `MiXaiLL76/IIIT5K_OCR`: cropped scene-text words, including number-heavy splits.
@@ -41,6 +41,13 @@ The training loader now mixes several OCR sources automatically:
 - `docling-project/DocLayNet-v1.2`: document regions with digital text cells, converted into text-bearing line crops.
 - `doc-analysis/XFUND`: multilingual form OCR, imported from the official release JSON/ZIP files and cropped into line-level samples.
 - structured synthetic receipts, addresses, invoices, and key-value layouts with line breaks.
+
+For interactive Colab iteration, `scripts/run_colab.sh` now uses a fast-start default profile:
+
+- enabled by default: synthetic data, `IIIT5K`
+- disabled by default: `IAM`, `TextOCR`, `SROIE`, `CORD`, `FUNSD`, `DocLayNet`, `XFUND`
+
+That keeps the default startup path away from the multi-GB corpora that have been dominating first-run setup time.
 
 The page-level datasets are converted into line-level crops because the current model is still a CTC recognizer optimized for line-style inputs.
 
@@ -67,7 +74,7 @@ The training script also prints a few `sample[i] ref=...` and `sample[i] pred=..
 - `scripts/train_colab.py` now requires CUDA by default, so Colab will fail fast instead of silently running on CPU.
 - `BATCH_SIZE=0` auto-scales from detected GPU VRAM. On a 96 GB card it will pick a much larger batch than the old fixed default.
 - The script defaults to `NUM_WORKERS=8` and `PREFETCH_FACTOR=4` to use more host RAM and keep the GPU busier.
-- IAM is disabled by default in the Colab runner because its Hugging Face mirrors have been the most common startup stall point. You can still opt in with `USE_IAM=1`.
+- The Colab runner now defaults to a fast-start dataset profile: synthetic data plus `IIIT5K`. The heavier corpora are opt-in so the default path reaches training quickly.
 - The dataset mix is materialized into system RAM after loading, so GPU feeding stays RAM-based. Drive is only used as the persistent mirror, not the live training cache.
 - The very first run on a new Drive cache still has to download the datasets from the internet once. Later runs should hydrate from Drive into `/content` instead of re-downloading from Hugging Face.
 - For that first run, authenticated Hub access matters. The official Hugging Face docs say `HF_TOKEN` is the environment variable used to authenticate Hub requests. In Colab, create a secret named `HF_TOKEN` and `scripts/run_colab.sh` will load it automatically. Docs: [HF environment variables](https://huggingface.co/docs/huggingface_hub/package_reference/environment_variables).
@@ -84,10 +91,16 @@ For large-memory Colab instances, the defaults are already tuned to use more GPU
 BATCH_SIZE=192 NUM_WORKERS=8 PREFETCH_FACTOR=4 PERSIST_ROOT=/content/drive/MyDrive/ittamt bash scripts/run_colab.sh
 ```
 
-To force IAM back into the mix:
+To opt back into heavier datasets:
 
 ```bash
-USE_IAM=1 bash scripts/run_colab.sh
+USE_IAM=1 USE_TEXTOCR=1 USE_SROIE=1 USE_CORD=1 USE_FUNSD=1 USE_DOCLAYNET=1 USE_XFUND=1 bash scripts/run_colab.sh
+```
+
+You can also enable only the sources you want, for example:
+
+```bash
+USE_TEXTOCR=1 USE_FUNSD=1 bash scripts/run_colab.sh
 ```
 
 If you want to disable Drive mounting and keep everything ephemeral in the current runtime:
