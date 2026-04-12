@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import random
+import signal
 import time
 import urllib.request
 import zipfile
@@ -489,10 +490,33 @@ def _cache_dir(cfg: DataConfig) -> str | None:
     return cfg.dataset_cache_dir
 
 
-def _load_dataset_logged(dataset_name: str, split: str, cfg: DataConfig):
+class _DatasetLoadTimeout(Exception):
+    pass
+
+
+def _load_dataset_logged(dataset_name: str, split: str, cfg: DataConfig, timeout_sec: int | None = None):
     _data_log(f"load_dataset start dataset={dataset_name} split={split}")
     started_at = time.perf_counter()
-    ds = load_dataset(dataset_name, split=split, cache_dir=_cache_dir(cfg))
+
+    previous_handler = None
+
+    def _timeout_handler(signum, frame):  # type: ignore[unused-argument]
+        raise _DatasetLoadTimeout(
+            f"load_dataset timed out after {timeout_sec}s for dataset={dataset_name} split={split}"
+        )
+
+    try:
+        if timeout_sec is not None and hasattr(signal, "SIGALRM"):
+            previous_handler = signal.getsignal(signal.SIGALRM)
+            signal.signal(signal.SIGALRM, _timeout_handler)
+            signal.alarm(timeout_sec)
+        ds = load_dataset(dataset_name, split=split, cache_dir=_cache_dir(cfg))
+    finally:
+        if timeout_sec is not None and hasattr(signal, "SIGALRM"):
+            signal.alarm(0)
+            if previous_handler is not None:
+                signal.signal(signal.SIGALRM, previous_handler)
+
     elapsed = time.perf_counter() - started_at
     try:
         row_count = len(ds)
@@ -548,7 +572,7 @@ def load_iam_split(split: str, cap: int, summary: dict[str, Any], cfg: DataConfi
     samples: list[Sample] = []
     for dataset_name in dataset_names:
         try:
-            ds = _load_dataset_logged(dataset_name, resolved_split, cfg)
+            ds = _load_dataset_logged(dataset_name, resolved_split, cfg, timeout_sec=90)
             iter_started_at = time.perf_counter()
             for seen, example in enumerate(ds, start=1):
                 text = _normalize_text(_safe_get_text(example), preserve_newlines=True)
