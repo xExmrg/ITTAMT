@@ -13,7 +13,7 @@ import numpy as np
 import torch
 from datasets import load_dataset
 from PIL import Image, ImageDraw, ImageFilter, ImageFont
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import ConcatDataset, DataLoader, Dataset
 
 from .tokenizer import CharTokenizer
 
@@ -131,6 +131,25 @@ class OCRDataset(Dataset):
             out["struct_valid"] = False
 
         return out
+
+
+class SyntheticOCRDataset(Dataset):
+    def __init__(self, size: int, tokenizer: CharTokenizer, cfg: DataConfig, seed: int):
+        self.size = size
+        self.tokenizer = tokenizer
+        self.cfg = cfg
+        self.seed = seed
+
+    def __len__(self) -> int:
+        return self.size
+
+    def __getitem__(self, idx: int) -> dict[str, Any]:
+        sample = _make_synthetic_sample(
+            width=self.cfg.image_width,
+            height=self.cfg.image_height,
+            rng=random.Random(self.seed + idx),
+        )
+        return OCRDataset([sample], self.tokenizer, self.cfg)[0]
 
 
 def _data_log(message: str) -> None:
@@ -353,24 +372,24 @@ def _extract_line_crops(
     return samples
 
 
-def _structured_synthetic_text() -> str:
-    invoice_id = random.randint(1000, 9999)
-    total_value = f"{random.randint(8, 299)}.{random.randint(0, 99):02d}"
-    day = random.randint(1, 28)
-    month = random.randint(1, 12)
-    phone = f"+49 30 {random.randint(100000, 999999)}"
+def _structured_synthetic_text(rng: random.Random) -> str:
+    invoice_id = rng.randint(1000, 9999)
+    total_value = f"{rng.randint(8, 299)}.{rng.randint(0, 99):02d}"
+    day = rng.randint(1, 28)
+    month = rng.randint(1, 12)
+    phone = f"+49 30 {rng.randint(100000, 999999)}"
     templates = [
         f"Invoice #{invoice_id}\nDate: 2026-{month:02d}-{day:02d}\nTotal: EUR {total_value}",
-        f"Ship To:\nMarta Stein\nBergstrasse {random.randint(1, 99)}\n10115 Berlin",
+        f"Ship To:\nMarta Stein\nBergstrasse {rng.randint(1, 99)}\n10115 Berlin",
         f"2 x Latte   9.50\n1 x Bagel   4.20\nTOTAL {total_value}",
         f"Meeting Notes\nRoom B-12\nCall me at {phone}",
         f"Order {invoice_id} | Qty 3 | Paid {total_value}",
         f"Name: Alex Rivera\nRef: AB-{invoice_id}\nStatus: APPROVED",
     ]
-    return random.choice(templates)
+    return rng.choice(templates)
 
 
-def make_synthetic_samples(n: int, width: int, height: int) -> list[Sample]:
+def _make_synthetic_sample(width: int, height: int, rng: random.Random, font: ImageFont.ImageFont | None = None) -> Sample:
     plain_phrases = [
         "The quick brown fox jumps over 13 lazy dogs.",
         "Invoice A-2048 paid on 2026-01-17.",
@@ -379,87 +398,90 @@ def make_synthetic_samples(n: int, width: int, height: int) -> list[Sample]:
         "Call me at 555-0199 after 7:30 PM!",
         "Structure-aware decoding improves readability.",
     ]
+    if font is None:
+        font = ImageFont.load_default()
+
+    text = _structured_synthetic_text(rng) if rng.random() < 0.65 else rng.choice(plain_phrases)
+    preserve_newlines = "\n" in text
+    spacing = 4
+    canvas_height = height if not preserve_newlines else height * rng.randint(2, 3)
+    image = Image.new("L", (width, canvas_height), color=255)
+    draw = ImageDraw.Draw(image)
+
+    if rng.random() < 0.5:
+        for y in range(0, canvas_height, max(12, canvas_height // 6)):
+            draw.line((0, y, width, y), fill=245, width=1)
+
+    x = rng.randint(6, 20)
+    y = rng.randint(6, max(7, canvas_height // 6))
+    fill = rng.randint(0, 50)
+    norm_text = _normalize_text(text, preserve_newlines=preserve_newlines)
+
+    text_mask = Image.new("L", (width, canvas_height), color=0)
+    mask_draw = ImageDraw.Draw(text_mask)
+    baseline_map = Image.new("L", (width, canvas_height), color=0)
+    base_draw = ImageDraw.Draw(baseline_map)
+    centers_map = Image.new("L", (width, canvas_height), color=0)
+    centers_draw = ImageDraw.Draw(centers_map)
+
+    try:
+        ascent, descent = font.getmetrics()
+    except Exception:
+        ascent, descent = 10, 3
+    line_h = int(ascent + descent + spacing)
+
+    def _text_length(s: str) -> float:
+        try:
+            return float(draw.textlength(s, font=font))
+        except Exception:
+            try:
+                return float(font.getsize(s)[0])
+            except Exception:
+                return float(len(s) * 8)
+
+    if preserve_newlines:
+        draw.multiline_text((x, y), norm_text, font=font, fill=fill, spacing=spacing)
+        mask_draw.multiline_text((x, y), norm_text, font=font, fill=255, spacing=spacing)
+        lines = norm_text.split("\n")
+    else:
+        draw.text((x, y), norm_text, font=font, fill=fill)
+        mask_draw.text((x, y), norm_text, font=font, fill=255)
+        lines = [norm_text]
+
+    for li, line in enumerate(lines):
+        baseline_y = float(y + ascent + li * line_h)
+        line_w = _text_length(line)
+        base_draw.line((x, baseline_y, x + line_w, baseline_y), fill=255, width=1)
+
+        for ci, ch in enumerate(line):
+            if ch == " ":
+                continue
+            prefix = line[:ci]
+            ch_w = _text_length(ch)
+            cx = float(x) + _text_length(prefix) + ch_w / 2.0
+            cy = baseline_y - float(ascent) / 2.0
+            r = 1
+            centers_draw.ellipse((cx - r, cy - r, cx + r, cy + r), fill=255)
+
+    baseline_map = baseline_map.filter(ImageFilter.GaussianBlur(radius=1.25))
+    centers_map = centers_map.filter(ImageFilter.GaussianBlur(radius=1.5))
+
+    return (
+        image.convert("RGB"),
+        norm_text,
+        {
+            "text_mask": text_mask,
+            "baseline_heatmap": baseline_map,
+            "char_center_heatmap": centers_map,
+        },
+    )
+
+
+def make_synthetic_samples(n: int, width: int, height: int) -> list[Sample]:
     font = ImageFont.load_default()
     samples: list[Sample] = []
-    for _ in range(n):
-        text = _structured_synthetic_text() if random.random() < 0.65 else random.choice(plain_phrases)
-        preserve_newlines = "\n" in text
-        spacing = 4
-        canvas_height = height if not preserve_newlines else height * random.randint(2, 3)
-        image = Image.new("L", (width, canvas_height), color=255)
-        draw = ImageDraw.Draw(image)
-
-        if random.random() < 0.5:
-            for y in range(0, canvas_height, max(12, canvas_height // 6)):
-                draw.line((0, y, width, y), fill=245, width=1)
-
-        x = random.randint(6, 20)
-        y = random.randint(6, max(7, canvas_height // 6))
-        fill = random.randint(0, 50)
-        norm_text = _normalize_text(text, preserve_newlines=preserve_newlines)
-
-        # Structure supervision derived from the exact synthetic render.
-        text_mask = Image.new("L", (width, canvas_height), color=0)
-        mask_draw = ImageDraw.Draw(text_mask)
-        baseline_map = Image.new("L", (width, canvas_height), color=0)
-        base_draw = ImageDraw.Draw(baseline_map)
-        centers_map = Image.new("L", (width, canvas_height), color=0)
-        centers_draw = ImageDraw.Draw(centers_map)
-
-        try:
-            ascent, descent = font.getmetrics()
-        except Exception:
-            ascent, descent = 10, 3
-        line_h = int(ascent + descent + spacing)
-
-        def _text_length(s: str) -> float:
-            try:
-                return float(draw.textlength(s, font=font))
-            except Exception:
-                try:
-                    return float(font.getsize(s)[0])
-                except Exception:
-                    return float(len(s) * 8)
-
-        if preserve_newlines:
-            draw.multiline_text((x, y), norm_text, font=font, fill=fill, spacing=spacing)
-            mask_draw.multiline_text((x, y), norm_text, font=font, fill=255, spacing=spacing)
-            lines = norm_text.split("\n")
-        else:
-            draw.text((x, y), norm_text, font=font, fill=fill)
-            mask_draw.text((x, y), norm_text, font=font, fill=255)
-            lines = [norm_text]
-
-        for li, line in enumerate(lines):
-            baseline_y = float(y + ascent + li * line_h)
-            line_w = _text_length(line)
-            base_draw.line((x, baseline_y, x + line_w, baseline_y), fill=255, width=1)
-
-            # Character center supervision (skip spaces to avoid ambiguous targets).
-            for ci, ch in enumerate(line):
-                if ch == " ":
-                    continue
-                prefix = line[:ci]
-                ch_w = _text_length(ch)
-                cx = float(x) + _text_length(prefix) + ch_w / 2.0
-                cy = baseline_y - float(ascent) / 2.0
-                r = 1
-                centers_draw.ellipse((cx - r, cy - r, cx + r, cy + r), fill=255)
-
-        baseline_map = baseline_map.filter(ImageFilter.GaussianBlur(radius=1.25))
-        centers_map = centers_map.filter(ImageFilter.GaussianBlur(radius=1.5))
-
-        samples.append(
-            (
-                image.convert("RGB"),
-                norm_text,
-                {
-                    "text_mask": text_mask,
-                    "baseline_heatmap": baseline_map,
-                    "char_center_heatmap": centers_map,
-                },
-            )
-        )
+    for idx in range(n):
+        samples.append(_make_synthetic_sample(width=width, height=height, rng=random.Random(1337 + idx), font=font))
     return samples
 
 
@@ -822,6 +844,8 @@ def build_dataloaders(tokenizer: CharTokenizer, cfg: DataConfig):
     summary: dict[str, Any] = {"train": {}, "validation": {}, "warnings": []}
     train_samples: list[Sample] = []
     val_samples: list[Sample] = []
+    train_parts: list[Dataset[Any]] = []
+    val_parts: list[Dataset[Any]] = []
 
     def _extend_with_stage(
         target: list[Sample],
@@ -839,19 +863,12 @@ def build_dataloaders(tokenizer: CharTokenizer, cfg: DataConfig):
 
     if cfg.use_synthetic:
         _data_log(
-            f"start synthetic generation train={cfg.synthetic_samples} validation={cfg.synthetic_val_samples}"
+            f"register lazy synthetic datasets train={cfg.synthetic_samples} validation={cfg.synthetic_val_samples}"
         )
-        synthetic_started_at = time.perf_counter()
-        synthetic_train = make_synthetic_samples(cfg.synthetic_samples, cfg.image_width, cfg.image_height)
-        synthetic_val = make_synthetic_samples(cfg.synthetic_val_samples, cfg.image_width, cfg.image_height)
-        train_samples.extend(synthetic_train)
-        val_samples.extend(synthetic_val)
-        _record_count(summary, "train", "synthetic", len(synthetic_train))
-        _record_count(summary, "validation", "synthetic", len(synthetic_val))
-        synthetic_elapsed = time.perf_counter() - synthetic_started_at
-        _data_log(
-            f"done synthetic generation: +{len(synthetic_train)} train, +{len(synthetic_val)} validation in {synthetic_elapsed:.1f}s"
-        )
+        train_parts.append(SyntheticOCRDataset(cfg.synthetic_samples, tokenizer, cfg, seed=1337))
+        val_parts.append(SyntheticOCRDataset(cfg.synthetic_val_samples, tokenizer, cfg, seed=7331))
+        _record_count(summary, "train", "synthetic", cfg.synthetic_samples)
+        _record_count(summary, "validation", "synthetic", cfg.synthetic_val_samples)
 
     if cfg.use_iam:
         _extend_with_stage(train_samples, "train", "iam", cfg.iam_train_cap, load_iam_split)
@@ -889,9 +906,13 @@ def build_dataloaders(tokenizer: CharTokenizer, cfg: DataConfig):
     random.shuffle(train_samples)
     random.shuffle(val_samples)
 
-    _data_log("constructing OCRDataset objects")
-    train_ds = OCRDataset(train_samples, tokenizer, cfg)
-    val_ds = OCRDataset(val_samples, tokenizer, cfg)
+    _data_log("constructing dataset objects")
+    if train_samples:
+        train_parts.append(OCRDataset(train_samples, tokenizer, cfg))
+    if val_samples:
+        val_parts.append(OCRDataset(val_samples, tokenizer, cfg))
+    train_ds = train_parts[0] if len(train_parts) == 1 else ConcatDataset(train_parts)
+    val_ds = val_parts[0] if len(val_parts) == 1 else ConcatDataset(val_parts)
 
     collate_fn = lambda batch: _collate(batch, pad_id=tokenizer.blank_id, seq_pad_id=tokenizer.pad_id)
     loader_kwargs: dict[str, Any] = {
