@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import random
+import time
 import urllib.request
 import zipfile
 from dataclasses import dataclass
@@ -130,6 +131,10 @@ class OCRDataset(Dataset):
             out["struct_valid"] = False
 
         return out
+
+
+def _data_log(message: str) -> None:
+    print(f"[data] {message}", flush=True)
 
 
 def _collate(batch: list[dict[str, Any]], pad_id: int, seq_pad_id: int | None = None):
@@ -818,49 +823,73 @@ def build_dataloaders(tokenizer: CharTokenizer, cfg: DataConfig):
     train_samples: list[Sample] = []
     val_samples: list[Sample] = []
 
+    def _extend_with_stage(
+        target: list[Sample],
+        split: str,
+        display_name: str,
+        cap: int,
+        loader: Any,
+    ) -> None:
+        _data_log(f"start {display_name} {split} (cap={cap})")
+        started_at = time.perf_counter()
+        loaded = loader(split, cap, summary, cfg)
+        elapsed = time.perf_counter() - started_at
+        target.extend(loaded)
+        _data_log(f"done {display_name} {split}: +{len(loaded)} samples in {elapsed:.1f}s")
+
     if cfg.use_synthetic:
+        _data_log(
+            f"start synthetic generation train={cfg.synthetic_samples} validation={cfg.synthetic_val_samples}"
+        )
+        synthetic_started_at = time.perf_counter()
         synthetic_train = make_synthetic_samples(cfg.synthetic_samples, cfg.image_width, cfg.image_height)
         synthetic_val = make_synthetic_samples(cfg.synthetic_val_samples, cfg.image_width, cfg.image_height)
         train_samples.extend(synthetic_train)
         val_samples.extend(synthetic_val)
         _record_count(summary, "train", "synthetic", len(synthetic_train))
         _record_count(summary, "validation", "synthetic", len(synthetic_val))
+        synthetic_elapsed = time.perf_counter() - synthetic_started_at
+        _data_log(
+            f"done synthetic generation: +{len(synthetic_train)} train, +{len(synthetic_val)} validation in {synthetic_elapsed:.1f}s"
+        )
 
     if cfg.use_iam:
-        train_samples.extend(load_iam_split("train", cfg.iam_train_cap, summary, cfg))
-        val_samples.extend(load_iam_split("validation", cfg.iam_val_cap, summary, cfg))
+        _extend_with_stage(train_samples, "train", "iam", cfg.iam_train_cap, load_iam_split)
+        _extend_with_stage(val_samples, "validation", "iam", cfg.iam_val_cap, load_iam_split)
 
     if cfg.use_iiit5k:
-        train_samples.extend(load_iiit5k_split("train", cfg.iiit5k_train_cap, summary, cfg))
-        val_samples.extend(load_iiit5k_split("validation", cfg.iiit5k_val_cap, summary, cfg))
+        _extend_with_stage(train_samples, "train", "iiit5k", cfg.iiit5k_train_cap, load_iiit5k_split)
+        _extend_with_stage(val_samples, "validation", "iiit5k", cfg.iiit5k_val_cap, load_iiit5k_split)
 
     if cfg.use_textocr:
-        train_samples.extend(load_textocr_split("train", cfg.textocr_train_cap, summary, cfg))
-        val_samples.extend(load_textocr_split("validation", cfg.textocr_val_cap, summary, cfg))
+        _extend_with_stage(train_samples, "train", "textocr", cfg.textocr_train_cap, load_textocr_split)
+        _extend_with_stage(val_samples, "validation", "textocr", cfg.textocr_val_cap, load_textocr_split)
 
     if cfg.use_sroie:
-        train_samples.extend(load_sroie_split("train", cfg.sroie_train_cap, summary, cfg))
-        val_samples.extend(load_sroie_split("validation", cfg.sroie_val_cap, summary, cfg))
+        _extend_with_stage(train_samples, "train", "sroie", cfg.sroie_train_cap, load_sroie_split)
+        _extend_with_stage(val_samples, "validation", "sroie", cfg.sroie_val_cap, load_sroie_split)
 
     if cfg.use_cord:
-        train_samples.extend(load_cord_split("train", cfg.cord_train_cap, summary, cfg))
-        val_samples.extend(load_cord_split("validation", cfg.cord_val_cap, summary, cfg))
+        _extend_with_stage(train_samples, "train", "cord", cfg.cord_train_cap, load_cord_split)
+        _extend_with_stage(val_samples, "validation", "cord", cfg.cord_val_cap, load_cord_split)
 
     if cfg.use_funsd:
-        train_samples.extend(load_funsd_split("train", cfg.funsd_train_cap, summary, cfg))
-        val_samples.extend(load_funsd_split("validation", cfg.funsd_val_cap, summary, cfg))
+        _extend_with_stage(train_samples, "train", "funsd", cfg.funsd_train_cap, load_funsd_split)
+        _extend_with_stage(val_samples, "validation", "funsd", cfg.funsd_val_cap, load_funsd_split)
 
     if cfg.use_doclaynet:
-        train_samples.extend(load_doclaynet_split("train", cfg.doclaynet_train_cap, summary, cfg))
-        val_samples.extend(load_doclaynet_split("validation", cfg.doclaynet_val_cap, summary, cfg))
+        _extend_with_stage(train_samples, "train", "doclaynet", cfg.doclaynet_train_cap, load_doclaynet_split)
+        _extend_with_stage(val_samples, "validation", "doclaynet", cfg.doclaynet_val_cap, load_doclaynet_split)
 
     if cfg.use_xfund:
-        train_samples.extend(load_xfund_split("train", cfg.xfund_train_cap, summary, cfg))
-        val_samples.extend(load_xfund_split("validation", cfg.xfund_val_cap, summary, cfg))
+        _extend_with_stage(train_samples, "train", "xfund", cfg.xfund_train_cap, load_xfund_split)
+        _extend_with_stage(val_samples, "validation", "xfund", cfg.xfund_val_cap, load_xfund_split)
 
+    _data_log(f"shuffle train/validation samples: train={len(train_samples)} validation={len(val_samples)}")
     random.shuffle(train_samples)
     random.shuffle(val_samples)
 
+    _data_log("constructing OCRDataset objects")
     train_ds = OCRDataset(train_samples, tokenizer, cfg)
     val_ds = OCRDataset(val_samples, tokenizer, cfg)
 
@@ -874,6 +903,9 @@ def build_dataloaders(tokenizer: CharTokenizer, cfg: DataConfig):
         loader_kwargs["persistent_workers"] = True
         loader_kwargs["prefetch_factor"] = max(2, cfg.prefetch_factor)
 
+    _data_log(
+        f"creating DataLoaders batch_size={cfg.batch_size} num_workers={cfg.num_workers} pin_memory={cfg.pin_memory}"
+    )
     train_loader = DataLoader(
         train_ds,
         batch_size=cfg.batch_size,
@@ -886,4 +918,5 @@ def build_dataloaders(tokenizer: CharTokenizer, cfg: DataConfig):
         shuffle=False,
         **loader_kwargs,
     )
+    _data_log("dataloaders ready")
     return train_loader, val_loader, summary

@@ -7,6 +7,7 @@ import os
 import shutil
 import textwrap
 import sys
+import time
 from pathlib import Path
 
 
@@ -226,6 +227,10 @@ def _print_dataset_summary(summary: dict[str, dict[str, int] | list[str]]) -> No
             print(f"  warning: {warning}")
 
 
+def _stage_log(message: str) -> None:
+    print(f"[train] {message}", flush=True)
+
+
 def mirror_output_artifacts(output_dir: Path, mirror_dir: Path | None) -> None:
     if mirror_dir is None:
         return
@@ -308,7 +313,11 @@ def main():
         synthetic_samples=args.synthetic_samples,
         synthetic_val_samples=args.synthetic_val_samples,
     )
+    _stage_log("building dataloaders")
+    dataloader_started_at = time.perf_counter()
     train_loader, val_loader, dataset_summary = build_dataloaders(tokenizer, data_cfg)
+    dataloader_elapsed = time.perf_counter() - dataloader_started_at
+    _stage_log(f"dataloaders built in {dataloader_elapsed:.1f}s")
     _print_dataset_summary(dataset_summary)
 
     model_cfg = StrideMoEConfig(vocab_size=len(tokenizer.itos), dim=256, depth=6, heads=8, num_experts=8, top_k=2)
@@ -327,8 +336,19 @@ def main():
         "enabled": device.type == "cuda",
     }
 
+    _stage_log("preflighting first training batch")
+    preflight_started_at = time.perf_counter()
+    sample_batch = next(iter(train_loader))
+    preflight_elapsed = time.perf_counter() - preflight_started_at
+    _stage_log(
+        f"first training batch ready in {preflight_elapsed:.1f}s "
+        f"(images={tuple(sample_batch['image'].shape)}, labels={tuple(sample_batch['labels'].shape)})"
+    )
+    del sample_batch
+
     best_val = float("inf")
     for epoch in range(1, args.epochs + 1):
+        _stage_log(f"starting epoch {epoch}/{args.epochs}")
         model.train()
         train_loss = 0.0
         pbar = tqdm(train_loader, desc=f"epoch {epoch} train")
