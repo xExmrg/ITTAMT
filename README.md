@@ -24,9 +24,9 @@ That one script does all of this:
 5. saves validation previews with reference and predicted text,
 6. exports checkpoints and TorchScript artifact.
 
-Artifacts and checkpoints are saved by default outside the repo in Colab under Google Drive at `/content/drive/MyDrive/ittamt/artifacts/stride_moe/`.
-Dataset caches are saved outside the repo in Colab under Google Drive at `/content/drive/MyDrive/ittamt/datasets/`.
-If Drive is not mounted, the script falls back to `/content/ittamt_persist/`.
+Artifacts and checkpoints are mirrored to Google Drive by default under `/content/drive/MyDrive/ittamt/artifacts/stride_moe/`.
+Dataset caches are persisted under `/content/drive/MyDrive/ittamt/datasets/`.
+The active training run now uses a fast local runtime workspace under `/content/ittamt_runtime/`, then syncs caches and artifacts back to Drive. If Drive is not mounted, the script falls back to `/content/ittamt_persist/`.
 
 ## Training data mix
 
@@ -63,11 +63,12 @@ The training script also prints a few `sample[i] ref=...` and `sample[i] pred=..
 ## Colab notes
 
 - Recommended GPU: **H100** (best), **A100** (great), otherwise any CUDA GPU works.
-- `scripts/run_colab.sh` mounts Google Drive automatically by default and keeps datasets, checkpoints, tokenizer, and exported artifacts under `/content/drive/MyDrive/ittamt/`, so you do not redownload everything after every code change.
+- `scripts/run_colab.sh` mounts Google Drive automatically by default, hydrates a fast local runtime cache under `/content/ittamt_runtime/`, and syncs datasets/checkpoints back to Drive after the run.
 - `scripts/train_colab.py` now requires CUDA by default, so Colab will fail fast instead of silently running on CPU.
 - `BATCH_SIZE=0` auto-scales from detected GPU VRAM. On a 96 GB card it will pick a much larger batch than the old fixed default.
 - The script defaults to `NUM_WORKERS=8` and `PREFETCH_FACTOR=4` to use more host RAM and keep the GPU busier.
-- The dataset mix is materialized into system RAM after loading, so Drive-backed caching mainly affects startup time; once the dataloaders are built, GPU feeding stays RAM-based rather than repeatedly streaming samples from Drive.
+- The dataset mix is materialized into system RAM after loading, so GPU feeding stays RAM-based. Drive is only used as the persistent mirror, not the live training cache.
+- The very first run on a new Drive cache still has to download the datasets from the internet once. Later runs should hydrate from Drive into `/content` instead of re-downloading from Hugging Face.
 - For free/limited Colab, reduce workload:
 
 ```bash
@@ -84,6 +85,12 @@ If you want to disable Drive mounting and keep everything ephemeral in the curre
 
 ```bash
 MOUNT_GOOGLE_DRIVE=0 PERSIST_ROOT=/content/ittamt_persist bash scripts/run_colab.sh
+```
+
+If you want to keep the Drive mirror but choose a different fast local runtime path:
+
+```bash
+LOCAL_RUNTIME_ROOT=/content/fast_ittamt_runtime bash scripts/run_colab.sh
 ```
 
 You can also reduce preview output volume:

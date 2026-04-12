@@ -4,6 +4,52 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
+sync_dir() {
+  local src="$1"
+  local dst="$2"
+  local mode="${3:-update}"
+
+  if [[ ! -d "$src" ]]; then
+    return 0
+  fi
+  mkdir -p "$dst"
+
+  if command -v rsync >/dev/null 2>&1; then
+    if [[ "$mode" == "hydrate" ]]; then
+      rsync -a --ignore-existing "$src"/ "$dst"/
+    else
+      rsync -a "$src"/ "$dst"/
+    fi
+    return 0
+  fi
+
+  python - "$src" "$dst" "$mode" <<'PY'
+from __future__ import annotations
+
+import shutil
+import sys
+from pathlib import Path
+
+src = Path(sys.argv[1])
+dst = Path(sys.argv[2])
+mode = sys.argv[3]
+
+if not src.exists():
+    raise SystemExit(0)
+
+for path in src.rglob("*"):
+    rel = path.relative_to(src)
+    target = dst / rel
+    if path.is_dir():
+        target.mkdir(parents=True, exist_ok=True)
+        continue
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if mode == "hydrate" and target.exists():
+        continue
+    shutil.copy2(path, target)
+PY
+}
+
 mount_google_drive() {
   python - <<'PY'
 from pathlib import Path
@@ -34,23 +80,67 @@ else
 fi
 
 PERSIST_ROOT="${PERSIST_ROOT:-$DEFAULT_PERSIST_ROOT}"
-OUTPUT_DIR="${OUTPUT_DIR:-$PERSIST_ROOT/artifacts/stride_moe}"
-DATASET_CACHE_DIR="${DATASET_CACHE_DIR:-$PERSIST_ROOT/datasets}"
+PERSIST_OUTPUT_DIR="${PERSIST_OUTPUT_DIR:-$PERSIST_ROOT/artifacts/stride_moe}"
+PERSIST_DATASET_CACHE_DIR="${PERSIST_DATASET_CACHE_DIR:-$PERSIST_ROOT/datasets}"
+PERSIST_HF_HOME="${PERSIST_HF_HOME:-$PERSIST_DATASET_CACHE_DIR/hf_home}"
+PERSIST_HF_DATASETS_CACHE="${PERSIST_HF_DATASETS_CACHE:-$PERSIST_DATASET_CACHE_DIR/datasets}"
+PERSIST_HUGGINGFACE_HUB_CACHE="${PERSIST_HUGGINGFACE_HUB_CACHE:-$PERSIST_DATASET_CACHE_DIR/hub}"
+PERSIST_TORCH_HOME="${PERSIST_TORCH_HOME:-$PERSIST_ROOT/torch}"
+
+if [[ -d /content ]]; then
+  DEFAULT_LOCAL_RUNTIME_ROOT="/content/ittamt_runtime"
+else
+  DEFAULT_LOCAL_RUNTIME_ROOT="$ROOT_DIR/.ittamt_runtime"
+fi
+
+LOCAL_RUNTIME_ROOT="${LOCAL_RUNTIME_ROOT:-$DEFAULT_LOCAL_RUNTIME_ROOT}"
+OUTPUT_DIR="${OUTPUT_DIR:-$LOCAL_RUNTIME_ROOT/artifacts/stride_moe}"
+DATASET_CACHE_DIR="${DATASET_CACHE_DIR:-$LOCAL_RUNTIME_ROOT/datasets}"
 HF_HOME="${HF_HOME:-$DATASET_CACHE_DIR/hf_home}"
 HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-$DATASET_CACHE_DIR/datasets}"
 HUGGINGFACE_HUB_CACHE="${HUGGINGFACE_HUB_CACHE:-$DATASET_CACHE_DIR/hub}"
-TORCH_HOME="${TORCH_HOME:-$PERSIST_ROOT/torch}"
+TORCH_HOME="${TORCH_HOME:-$LOCAL_RUNTIME_ROOT/torch}"
+
+mkdir -p \
+  "$OUTPUT_DIR" \
+  "$HF_HOME" \
+  "$HF_DATASETS_CACHE" \
+  "$HUGGINGFACE_HUB_CACHE" \
+  "$TORCH_HOME" \
+  "$PERSIST_OUTPUT_DIR" \
+  "$PERSIST_HF_HOME" \
+  "$PERSIST_HF_DATASETS_CACHE" \
+  "$PERSIST_HUGGINGFACE_HUB_CACHE" \
+  "$PERSIST_TORCH_HOME"
+
+echo "persistent storage root: $PERSIST_ROOT"
+echo "local runtime root: $LOCAL_RUNTIME_ROOT"
+echo "runtime dataset cache dir: $HF_DATASETS_CACHE"
+echo "runtime output dir: $OUTPUT_DIR"
+echo "persistent output dir: $PERSIST_OUTPUT_DIR"
+
+echo "hydrating local runtime caches from persistent storage..."
+sync_dir "$PERSIST_HF_HOME" "$HF_HOME" hydrate
+sync_dir "$PERSIST_HF_DATASETS_CACHE" "$HF_DATASETS_CACHE" hydrate
+sync_dir "$PERSIST_HUGGINGFACE_HUB_CACHE" "$HUGGINGFACE_HUB_CACHE" hydrate
+sync_dir "$PERSIST_TORCH_HOME" "$TORCH_HOME" hydrate
+sync_dir "$PERSIST_OUTPUT_DIR" "$OUTPUT_DIR" hydrate
+
+persist_back() {
+  echo "syncing runtime caches and artifacts back to persistent storage..."
+  sync_dir "$HF_HOME" "$PERSIST_HF_HOME" update
+  sync_dir "$HF_DATASETS_CACHE" "$PERSIST_HF_DATASETS_CACHE" update
+  sync_dir "$HUGGINGFACE_HUB_CACHE" "$PERSIST_HUGGINGFACE_HUB_CACHE" update
+  sync_dir "$TORCH_HOME" "$PERSIST_TORCH_HOME" update
+  sync_dir "$OUTPUT_DIR" "$PERSIST_OUTPUT_DIR" update
+}
+
+trap persist_back EXIT
 
 export HF_HOME
 export HF_DATASETS_CACHE
 export HUGGINGFACE_HUB_CACHE
 export TORCH_HOME
-
-mkdir -p "$OUTPUT_DIR" "$HF_HOME" "$HF_DATASETS_CACHE" "$HUGGINGFACE_HUB_CACHE" "$TORCH_HOME"
-
-echo "persistent storage root: $PERSIST_ROOT"
-echo "dataset cache dir: $HF_DATASETS_CACHE"
-echo "output dir: $OUTPUT_DIR"
 
 python -m pip install -U pip
 pip install -r requirements.txt
@@ -62,4 +152,5 @@ python scripts/train_colab.py \
   --prefetch-factor "${PREFETCH_FACTOR:-4}" \
   --synthetic-samples "${SYNTHETIC_SAMPLES:-40000}" \
   --dataset-cache-dir "$HF_DATASETS_CACHE" \
-  --output-dir "$OUTPUT_DIR"
+  --output-dir "$OUTPUT_DIR" \
+  --mirror-output-dir "$PERSIST_OUTPUT_DIR"

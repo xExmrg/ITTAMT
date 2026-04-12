@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import textwrap
 import sys
 from pathlib import Path
@@ -97,12 +98,25 @@ def default_persist_root() -> Path:
     return Path.home() / ".cache" / "ittamt"
 
 
+def default_runtime_root() -> Path:
+    if running_in_colab():
+        return Path("/content/ittamt_runtime")
+    return Path.cwd() / ".ittamt_runtime"
+
+
 def default_dataset_cache_dir() -> str:
-    return str(default_persist_root() / "datasets")
+    return str(default_runtime_root() / "datasets")
 
 
 def default_output_dir() -> str:
-    return str(default_persist_root() / "artifacts" / "stride_moe")
+    return str(default_runtime_root() / "artifacts" / "stride_moe")
+
+
+def default_mirror_output_dir() -> str | None:
+    persist_root = default_persist_root()
+    if running_in_colab() and persist_root == Path("/content/ittamt_persist"):
+        return None
+    return str(persist_root / "artifacts" / "stride_moe")
 
 
 def resolve_batch_size(requested_batch_size: int, device: torch.device) -> tuple[int, str]:
@@ -212,6 +226,21 @@ def _print_dataset_summary(summary: dict[str, dict[str, int] | list[str]]) -> No
             print(f"  warning: {warning}")
 
 
+def mirror_output_artifacts(output_dir: Path, mirror_dir: Path | None) -> None:
+    if mirror_dir is None:
+        return
+
+    mirror_dir.mkdir(parents=True, exist_ok=True)
+    for name in ["tokenizer.json", "last.pt", "best.pt", "model_ts.pt", "train_meta.json"]:
+        src = output_dir / name
+        if src.exists():
+            shutil.copy2(src, mirror_dir / name)
+
+    preview_src = output_dir / "eval_previews"
+    if preview_src.exists():
+        shutil.copytree(preview_src, mirror_dir / "eval_previews", dirs_exist_ok=True)
+
+
 def main():
     ap = argparse.ArgumentParser(description="Train STRIDE-MoE OCR on Colab")
     ap.add_argument("--epochs", type=int, default=6)
@@ -227,6 +256,7 @@ def main():
     ap.add_argument("--dataset-cache-dir", type=str, default=None)
     ap.add_argument("--allow-non-cuda", action="store_true", help="Allow fallback to CPU/MPS instead of requiring CUDA")
     ap.add_argument("--output-dir", type=str, default=None)
+    ap.add_argument("--mirror-output-dir", type=str, default=None)
     args = ap.parse_args()
 
     device = get_device()
@@ -243,6 +273,10 @@ def main():
     dataset_cache_dir.mkdir(parents=True, exist_ok=True)
     output_dir = Path(args.output_dir or default_output_dir()).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
+    mirror_output_dir_arg = args.mirror_output_dir or default_mirror_output_dir()
+    mirror_output_dir = Path(mirror_output_dir_arg).resolve() if mirror_output_dir_arg else None
+    if mirror_output_dir is not None:
+        mirror_output_dir.mkdir(parents=True, exist_ok=True)
 
     print("runtime config:")
     print(f"  device: {runtime_info['device']}")
@@ -255,11 +289,13 @@ def main():
     print(f"  prefetch_factor: {args.prefetch_factor}")
     print(f"  dataset_cache_dir: {dataset_cache_dir}")
     print(f"  output_dir: {output_dir}")
+    print(f"  mirror_output_dir: {mirror_output_dir if mirror_output_dir is not None else 'disabled'}")
     if running_in_colab():
         print(f"  persist_root: {default_persist_root()}")
 
     tokenizer = CharTokenizer.build_default()
     tokenizer.save(str(output_dir / "tokenizer.json"))
+    mirror_output_artifacts(output_dir, mirror_output_dir)
 
     data_cfg = DataConfig(
         image_height=args.image_height,
@@ -374,6 +410,8 @@ def main():
             best_val = val_loss
             torch.save(ckpt, output_dir / "best.pt")
 
+        mirror_output_artifacts(output_dir, mirror_output_dir)
+
     # Export TorchScript for macOS-friendly inference
     model.eval()
     dummy = torch.randn(1, 1, args.image_height, args.image_width, device=device)
@@ -400,6 +438,7 @@ def main():
             f,
             indent=2,
         )
+    mirror_output_artifacts(output_dir, mirror_output_dir)
 
 
 if __name__ == "__main__":
