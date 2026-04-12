@@ -258,6 +258,7 @@ def main():
     ap.add_argument("--num-workers", type=int, default=8)
     ap.add_argument("--prefetch-factor", type=int, default=4)
     ap.add_argument("--preview-count", type=int, default=4)
+    ap.add_argument("--use-iam", type=int, choices=[0, 1], default=0, help="Enable IAM line dataset loading")
     ap.add_argument("--dataset-cache-dir", type=str, default=None)
     ap.add_argument("--allow-non-cuda", action="store_true", help="Allow fallback to CPU/MPS instead of requiring CUDA")
     ap.add_argument("--output-dir", type=str, default=None)
@@ -312,6 +313,7 @@ def main():
         dataset_cache_dir=str(dataset_cache_dir),
         synthetic_samples=args.synthetic_samples,
         synthetic_val_samples=args.synthetic_val_samples,
+        use_iam=bool(args.use_iam),
     )
     _stage_log("building dataloaders")
     dataloader_started_at = time.perf_counter()

@@ -195,6 +195,7 @@ python scripts/train_colab.py \
   --num-workers "${NUM_WORKERS:-8}" \
   --prefetch-factor "${PREFETCH_FACTOR:-4}" \
   --synthetic-samples "${SYNTHETIC_SAMPLES:-40000}" \
+  --use-iam "${USE_IAM:-0}" \
   --dataset-cache-dir "$HF_DATASETS_CACHE" \
   --output-dir "$OUTPUT_DIR" \
   --mirror-output-dir "$PERSIST_OUTPUT_DIR"

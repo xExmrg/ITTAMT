@@ -67,6 +67,7 @@ The training script also prints a few `sample[i] ref=...` and `sample[i] pred=..
 - `scripts/train_colab.py` now requires CUDA by default, so Colab will fail fast instead of silently running on CPU.
 - `BATCH_SIZE=0` auto-scales from detected GPU VRAM. On a 96 GB card it will pick a much larger batch than the old fixed default.
 - The script defaults to `NUM_WORKERS=8` and `PREFETCH_FACTOR=4` to use more host RAM and keep the GPU busier.
+- IAM is disabled by default in the Colab runner because its Hugging Face mirrors have been the most common startup stall point. You can still opt in with `USE_IAM=1`.
 - The dataset mix is materialized into system RAM after loading, so GPU feeding stays RAM-based. Drive is only used as the persistent mirror, not the live training cache.
 - The very first run on a new Drive cache still has to download the datasets from the internet once. Later runs should hydrate from Drive into `/content` instead of re-downloading from Hugging Face.
 - For that first run, authenticated Hub access matters. The official Hugging Face docs say `HF_TOKEN` is the environment variable used to authenticate Hub requests. In Colab, create a secret named `HF_TOKEN` and `scripts/run_colab.sh` will load it automatically. Docs: [HF environment variables](https://huggingface.co/docs/huggingface_hub/package_reference/environment_variables).
@@ -81,6 +82,12 @@ For large-memory Colab instances, the defaults are already tuned to use more GPU
 
 ```bash
 BATCH_SIZE=192 NUM_WORKERS=8 PREFETCH_FACTOR=4 PERSIST_ROOT=/content/drive/MyDrive/ittamt bash scripts/run_colab.sh
+```
+
+To force IAM back into the mix:
+
+```bash
+USE_IAM=1 bash scripts/run_colab.sh
 ```
 
 If you want to disable Drive mounting and keep everything ephemeral in the current runtime:
