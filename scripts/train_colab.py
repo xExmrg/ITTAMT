@@ -88,16 +88,21 @@ def running_in_colab() -> bool:
     return "COLAB_GPU" in os.environ or Path("/content").exists()
 
 
-def default_dataset_cache_dir() -> str:
+def default_persist_root() -> Path:
     if running_in_colab():
-        return "/content/ittamt_datasets"
-    return str(Path.home() / ".cache" / "ittamt_datasets")
+        drive_root = Path("/content/drive/MyDrive")
+        if drive_root.exists():
+            return drive_root / "ittamt"
+        return Path("/content/ittamt_persist")
+    return Path.home() / ".cache" / "ittamt"
+
+
+def default_dataset_cache_dir() -> str:
+    return str(default_persist_root() / "datasets")
 
 
 def default_output_dir() -> str:
-    if running_in_colab():
-        return "/content/ittamt_artifacts/stride_moe"
-    return "artifacts/stride_moe"
+    return str(default_persist_root() / "artifacts" / "stride_moe")
 
 
 def resolve_batch_size(requested_batch_size: int, device: torch.device) -> tuple[int, str]:
@@ -250,6 +255,8 @@ def main():
     print(f"  prefetch_factor: {args.prefetch_factor}")
     print(f"  dataset_cache_dir: {dataset_cache_dir}")
     print(f"  output_dir: {output_dir}")
+    if running_in_colab():
+        print(f"  persist_root: {default_persist_root()}")
 
     tokenizer = CharTokenizer.build_default()
     tokenizer.save(str(output_dir / "tokenizer.json"))

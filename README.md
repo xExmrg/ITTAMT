@@ -24,8 +24,9 @@ That one script does all of this:
 5. saves validation previews with reference and predicted text,
 6. exports checkpoints and TorchScript artifact.
 
-Artifacts are saved by default outside the repo in Colab under `/content/ittamt_artifacts/stride_moe/`.
-Dataset caches are saved outside the repo in Colab under `/content/ittamt_datasets/`.
+Artifacts and checkpoints are saved by default outside the repo in Colab under Google Drive at `/content/drive/MyDrive/ittamt/artifacts/stride_moe/`.
+Dataset caches are saved outside the repo in Colab under Google Drive at `/content/drive/MyDrive/ittamt/datasets/`.
+If Drive is not mounted, the script falls back to `/content/ittamt_persist/`.
 
 ## Training data mix
 
@@ -62,9 +63,11 @@ The training script also prints a few `sample[i] ref=...` and `sample[i] pred=..
 ## Colab notes
 
 - Recommended GPU: **H100** (best), **A100** (great), otherwise any CUDA GPU works.
+- `scripts/run_colab.sh` mounts Google Drive automatically by default and keeps datasets, checkpoints, tokenizer, and exported artifacts under `/content/drive/MyDrive/ittamt/`, so you do not redownload everything after every code change.
 - `scripts/train_colab.py` now requires CUDA by default, so Colab will fail fast instead of silently running on CPU.
 - `BATCH_SIZE=0` auto-scales from detected GPU VRAM. On a 96 GB card it will pick a much larger batch than the old fixed default.
 - The script defaults to `NUM_WORKERS=8` and `PREFETCH_FACTOR=4` to use more host RAM and keep the GPU busier.
+- The dataset mix is materialized into system RAM after loading, so Drive-backed caching mainly affects startup time; once the dataloaders are built, GPU feeding stays RAM-based rather than repeatedly streaming samples from Drive.
 - For free/limited Colab, reduce workload:
 
 ```bash
@@ -74,7 +77,13 @@ EPOCHS=2 BATCH_SIZE=8 SYNTHETIC_SAMPLES=12000 bash scripts/run_colab.sh
 For large-memory Colab instances, the defaults are already tuned to use more GPU/CPU RAM. If you still want to override them manually:
 
 ```bash
-BATCH_SIZE=192 NUM_WORKERS=8 PREFETCH_FACTOR=4 DATASET_CACHE_DIR=/content/ittamt_datasets OUTPUT_DIR=/content/ittamt_artifacts/stride_moe bash scripts/run_colab.sh
+BATCH_SIZE=192 NUM_WORKERS=8 PREFETCH_FACTOR=4 PERSIST_ROOT=/content/drive/MyDrive/ittamt bash scripts/run_colab.sh
+```
+
+If you want to disable Drive mounting and keep everything ephemeral in the current runtime:
+
+```bash
+MOUNT_GOOGLE_DRIVE=0 PERSIST_ROOT=/content/ittamt_persist bash scripts/run_colab.sh
 ```
 
 You can also reduce preview output volume:
