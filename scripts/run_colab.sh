@@ -69,6 +69,39 @@ else:
 PY
 }
 
+load_hf_token() {
+  if [[ -n "${HF_TOKEN:-}" ]]; then
+    return 0
+  fi
+
+  local token=""
+  if [[ -d /content ]]; then
+    token="$(python - <<'PY'
+try:
+    from google.colab import userdata  # type: ignore
+except Exception:
+    raise SystemExit(0)
+
+try:
+    token = userdata.get("HF_TOKEN")
+except Exception:
+    token = ""
+
+if token:
+    print(token)
+PY
+)"
+  fi
+
+  if [[ -z "$token" && -f "$PERSIST_ROOT/.hf_token" ]]; then
+    token="$(<"$PERSIST_ROOT/.hf_token")"
+  fi
+
+  if [[ -n "$token" ]]; then
+    export HF_TOKEN="$token"
+  fi
+}
+
 if [[ "${MOUNT_GOOGLE_DRIVE:-1}" == "1" && -d /content ]]; then
   mount_google_drive
 fi
@@ -137,13 +170,24 @@ persist_back() {
 
 trap persist_back EXIT
 
+load_hf_token
+
 export HF_HOME
+export HF_HUB_CACHE="${HF_HUB_CACHE:-$HUGGINGFACE_HUB_CACHE}"
 export HF_DATASETS_CACHE
 export HUGGINGFACE_HUB_CACHE
 export TORCH_HOME
+export HF_XET_HIGH_PERFORMANCE="${HF_XET_HIGH_PERFORMANCE:-1}"
 
 python -m pip install -U pip
 pip install -r requirements.txt
+
+if [[ -n "${HF_TOKEN:-}" ]]; then
+  echo "hugging face auth: enabled"
+else
+  echo "hugging face auth: missing HF_TOKEN, first-time downloads may be rate-limited"
+fi
+echo "hf_xet_high_performance: ${HF_XET_HIGH_PERFORMANCE}"
 
 python scripts/train_colab.py \
   --epochs "${EPOCHS:-6}" \

@@ -69,6 +69,8 @@ The training script also prints a few `sample[i] ref=...` and `sample[i] pred=..
 - The script defaults to `NUM_WORKERS=8` and `PREFETCH_FACTOR=4` to use more host RAM and keep the GPU busier.
 - The dataset mix is materialized into system RAM after loading, so GPU feeding stays RAM-based. Drive is only used as the persistent mirror, not the live training cache.
 - The very first run on a new Drive cache still has to download the datasets from the internet once. Later runs should hydrate from Drive into `/content` instead of re-downloading from Hugging Face.
+- For that first run, authenticated Hub access matters. The official Hugging Face docs say `HF_TOKEN` is the environment variable used to authenticate Hub requests. In Colab, create a secret named `HF_TOKEN` and `scripts/run_colab.sh` will load it automatically. Docs: [HF environment variables](https://huggingface.co/docs/huggingface_hub/package_reference/environment_variables).
+- The runner also enables `HF_XET_HIGH_PERFORMANCE=1` by default in Colab to push Hugging Face Xet downloads harder on large machines.
 - For free/limited Colab, reduce workload:
 
 ```bash
@@ -91,6 +93,13 @@ If you want to keep the Drive mirror but choose a different fast local runtime p
 
 ```bash
 LOCAL_RUNTIME_ROOT=/content/fast_ittamt_runtime bash scripts/run_colab.sh
+```
+
+If you prefer not to use Colab secrets, you can store the token in your Drive-backed persistent root:
+
+```bash
+echo "hf_xxx_your_token" > /content/drive/MyDrive/ittamt/.hf_token
+chmod 600 /content/drive/MyDrive/ittamt/.hf_token
 ```
 
 You can also reduce preview output volume:
